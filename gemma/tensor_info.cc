@@ -19,6 +19,7 @@
 #include <stdint.h>
 
 #include <string>
+#include <vector>
 
 #include "compression/types.h"
 #include "gemma/configs.h"
@@ -298,16 +299,72 @@ void TensorInfoRegistry::AddLayerTensors(const ModelConfig& config,
   const std::string suffix = LayerSuffix(layer_idx);
   Add(suffix, {
                   .base_name = "key_norm",
-                  .source_names = {"attn/_key_norm/scale"},
+                  .source_names = {"attn/_key_norm/scale", "attn/key_norm/scale"},
                   .axes = {0},
                   .shape = {layer_config.qkv_dim},
                   .min_size = Type::kBF16,
               });
   Add(suffix, {
                   .base_name = "query_norm",
-                  .source_names = {"attn/_query_norm/scale"},
+                  .source_names = {"attn/_query_norm/scale", "attn/query_norm/scale"},
                   .axes = {0},
                   .shape = {layer_config.qkv_dim},
+                  .min_size = Type::kBF16,
+              });
+  Add(suffix, {
+                  .base_name = "qc_in_min",
+                  .source_names = {"attn/q_einsum/ClippedEinsum_0/clip_input_min"},
+                  .axes = {0},
+                  .shape = {1},
+                  .min_size = Type::kBF16,
+              });
+  Add(suffix, {
+                  .base_name = "qc_in_max",
+                  .source_names = {"attn/q_einsum/ClippedEinsum_0/clip_input_max"},
+                  .axes = {0},
+                  .shape = {1},
+                  .min_size = Type::kBF16,
+              });
+  Add(suffix, {
+                  .base_name = "qc_out_min",
+                  .source_names = {"attn/q_einsum/ClippedEinsum_0/clip_output_min"},
+                  .axes = {0},
+                  .shape = {1},
+                  .min_size = Type::kBF16,
+              });
+  Add(suffix, {
+                  .base_name = "qc_out_max",
+                  .source_names = {"attn/q_einsum/ClippedEinsum_0/clip_output_max"},
+                  .axes = {0},
+                  .shape = {1},
+                  .min_size = Type::kBF16,
+              });
+  Add(suffix, {
+                  .base_name = "kvc_in_min",
+                  .source_names = {"attn/kv_einsum/ClippedEinsum_0/clip_input_min", "attn/k_einsum/ClippedEinsum_0/clip_input_min"},
+                  .axes = {0},
+                  .shape = {1},
+                  .min_size = Type::kBF16,
+              });
+  Add(suffix, {
+                  .base_name = "kvc_in_max",
+                  .source_names = {"attn/kv_einsum/ClippedEinsum_0/clip_input_max", "attn/k_einsum/ClippedEinsum_0/clip_input_max"},
+                  .axes = {0},
+                  .shape = {1},
+                  .min_size = Type::kBF16,
+              });
+  Add(suffix, {
+                  .base_name = "kvc_out_min",
+                  .source_names = {"attn/kv_einsum/ClippedEinsum_0/clip_output_min", "attn/k_einsum/ClippedEinsum_0/clip_output_min"},
+                  .axes = {0},
+                  .shape = {1},
+                  .min_size = Type::kBF16,
+              });
+  Add(suffix, {
+                  .base_name = "kvc_out_max",
+                  .source_names = {"attn/kv_einsum/ClippedEinsum_0/clip_output_max", "attn/k_einsum/ClippedEinsum_0/clip_output_max"},
+                  .axes = {0},
+                  .shape = {1},
                   .min_size = Type::kBF16,
               });
   Add(suffix, {
@@ -320,8 +377,12 @@ void TensorInfoRegistry::AddLayerTensors(const ModelConfig& config,
               });
   Add(suffix, {
                   .base_name = "qkv2_w",
-                  .source_names = {"attn/kv_einsum/w"},
-                  .axes = {1, 0, 3, 2},
+                  .source_names = {layer_config.kv_heads == 1
+                                       ? "attn/k_einsum/w"
+                                       : "attn/kv_einsum/w"},
+                  .axes = layer_config.kv_heads == 1
+                              ? std::vector<size_t>{0, 2, 1}
+                              : std::vector<size_t>{1, 0, 3, 2},
                   .shape = {2 * layer_config.kv_heads * layer_config.qkv_dim,
                             config.model_dim},
                   .concat_names = {""},
@@ -363,35 +424,7 @@ void TensorInfoRegistry::AddLayerTensors(const ModelConfig& config,
                   .min_size = Type::kF32,
               });
 
-  Add(suffix, {
-                  .base_name = "gating_ein",
-                  .source_names = {"mlp/gating_einsum/w", "mlp/gating_einsum",
-                                   "mlp_block/ffw_up/w"},
-                  .axes = {0, layer_config.optimized_gating ? 1u : 2u,
-                           layer_config.optimized_gating ? 2u : 1u},
-                  .shape = {2, layer_config.ff_hidden_dim, config.model_dim},
-              });
-  Add(suffix, {
-                  .base_name = "gating1_w",
-                  .source_names = {"none"},
-                  .axes = {0, layer_config.optimized_gating ? 1u : 2u,
-                           layer_config.optimized_gating ? 2u : 1u},
-                  .shape = {layer_config.ff_hidden_dim, config.model_dim},
-              });
-  Add(suffix, {
-                  .base_name = "gating2_w",
-                  .source_names = {"none"},
-                  .axes = {0, layer_config.optimized_gating ? 1u : 2u,
-                           layer_config.optimized_gating ? 2u : 1u},
-                  .shape = {layer_config.ff_hidden_dim, config.model_dim},
-              });
-  Add(suffix, {
-                  .base_name = "linear_w",
-                  .source_names = {"mlp/linear/w", "mlp/linear",
-                                   "mlp_block/ffw_down/kernel"},
-                  .axes = {1, 0},
-                  .shape = {config.model_dim, layer_config.ff_hidden_dim},
-              });
+
   Add(suffix, {
                   .base_name = "pre_att_ns",
                   .source_names = {"pre_attention_norm/scale",
@@ -423,6 +456,13 @@ void TensorInfoRegistry::AddLayerTensors(const ModelConfig& config,
                   .min_size = Type::kBF16,
               });
   Add(suffix, {
+                  .base_name = "skip_scale",
+                  .source_names = {"skip_scale"},
+                  .axes = {0},
+                  .shape = {1},
+                  .min_size = Type::kBF16,
+              });
+  Add(suffix, {
                   .base_name = "ffw_gat_b",
                   .source_names = {"mlp_block/ffw_up/b"},
                   .axes = {0},
@@ -436,6 +476,91 @@ void TensorInfoRegistry::AddLayerTensors(const ModelConfig& config,
                   .shape = {config.model_dim},
                   .min_size = Type::kF32,
               });
+  Add(suffix, {
+                  .base_name = "gating_ein",
+                  .source_names = {"mlp/gating_einsum/w", "mlp/gating_einsum",
+                                   "mlp_block/ffw_up/w", "mlp2/gating_einsum/w"},
+                  .axes = {0, layer_config.optimized_gating ? 1u : 2u,
+                           layer_config.optimized_gating ? 2u : 1u},
+                  .shape = {2, layer_config.ff_hidden_dim, config.model_dim},
+              });
+  Add(suffix, {
+                  .base_name = "gating1_w",
+                  .source_names = {"none"},
+                  .axes = {0, layer_config.optimized_gating ? 1u : 2u,
+                           layer_config.optimized_gating ? 2u : 1u},
+                  .shape = {layer_config.ff_hidden_dim, config.model_dim},
+              });
+  Add(suffix, {
+                  .base_name = "gating2_w",
+                  .source_names = {"none"},
+                  .axes = {0, layer_config.optimized_gating ? 1u : 2u,
+                           layer_config.optimized_gating ? 2u : 1u},
+                  .shape = {layer_config.ff_hidden_dim, config.model_dim},
+              });
+  Add(suffix, {
+                  .base_name = "gtc_in_min",
+                  .source_names = {"mlp/gating_einsum/ClippedEinsum_0/clip_input_min"},
+                  .axes = {0},
+                  .shape = {1},
+                  .min_size = Type::kBF16,
+              });
+  Add(suffix, {
+                  .base_name = "gtc_in_max",
+                  .source_names = {"mlp/gating_einsum/ClippedEinsum_0/clip_input_max"},
+                  .axes = {0},
+                  .shape = {1},
+                  .min_size = Type::kBF16,
+              });
+  Add(suffix, {
+                  .base_name = "gtc_out_min",
+                  .source_names = {"mlp/gating_einsum/ClippedEinsum_0/clip_output_min"},
+                  .axes = {0},
+                  .shape = {1},
+                  .min_size = Type::kBF16,
+              });
+  Add(suffix, {
+                  .base_name = "gtc_out_max",
+                  .source_names = {"mlp/gating_einsum/ClippedEinsum_0/clip_output_max"},
+                  .axes = {0},
+                  .shape = {1},
+                  .min_size = Type::kBF16,
+              });
+  Add(suffix, {
+                  .base_name = "linear_w",
+                  .source_names = {"mlp/linear/w", "mlp/linear",
+                                   "mlp_block/ffw_down/kernel", "mlp2/linear/w"},
+                  .axes = {1, 0},
+                  .shape = {config.model_dim, layer_config.ff_hidden_dim},
+              });
+  Add(suffix, {
+                  .base_name = "linc_in_min",
+                  .source_names = {"mlp/linear/ClippedEinsum_0/clip_input_min"},
+                  .axes = {0},
+                  .shape = {1},
+                  .min_size = Type::kBF16,
+              });
+  Add(suffix, {
+                  .base_name = "linc_in_max",
+                  .source_names = {"mlp/linear/ClippedEinsum_0/clip_input_max"},
+                  .axes = {0},
+                  .shape = {1},
+                  .min_size = Type::kBF16,
+              });
+  Add(suffix, {
+                  .base_name = "linc_out_min",
+                  .source_names = {"mlp/linear/ClippedEinsum_0/clip_output_min"},
+                  .axes = {0},
+                  .shape = {1},
+                  .min_size = Type::kBF16,
+              });
+  Add(suffix, {
+                  .base_name = "linc_out_max",
+                  .source_names = {"mlp/linear/ClippedEinsum_0/clip_output_max"},
+                  .axes = {0},
+                  .shape = {1},
+                  .min_size = Type::kBF16,
+              });
   Add(suffix,
       {
           .base_name = "att_ein",
@@ -446,6 +571,34 @@ void TensorInfoRegistry::AddLayerTensors(const ModelConfig& config,
           .axes = {0, 2, 1},
           .shape = {layer_config.heads, config.model_dim, layer_config.qkv_dim},
       });
+  Add(suffix, {
+                  .base_name = "aoc_in_min",
+                  .source_names = {"attn/attn_vec_einsum/ClippedEinsum_0/clip_input_min"},
+                  .axes = {0},
+                  .shape = {1},
+                  .min_size = Type::kBF16,
+              });
+  Add(suffix, {
+                  .base_name = "aoc_in_max",
+                  .source_names = {"attn/attn_vec_einsum/ClippedEinsum_0/clip_input_max"},
+                  .axes = {0},
+                  .shape = {1},
+                  .min_size = Type::kBF16,
+              });
+  Add(suffix, {
+                  .base_name = "aoc_out_min",
+                  .source_names = {"attn/attn_vec_einsum/ClippedEinsum_0/clip_output_min"},
+                  .axes = {0},
+                  .shape = {1},
+                  .min_size = Type::kBF16,
+              });
+  Add(suffix, {
+                  .base_name = "aoc_out_max",
+                  .source_names = {"attn/attn_vec_einsum/ClippedEinsum_0/clip_output_max"},
+                  .axes = {0},
+                  .shape = {1},
+                  .min_size = Type::kBF16,
+              });
   Add(suffix,
       {
           .base_name = "att_w",

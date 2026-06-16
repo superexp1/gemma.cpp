@@ -40,11 +40,21 @@ typedef std::vector<BF16, hwy::AlignedAllocator<BF16>> AlignedBF16Vector;
 
 // Returns the scale value to use for the query in the attention computation.
 // Also called by ops_test.
+static inline size_t MaxQkvDim(const ModelConfig& config) {
+  size_t max_dim = 0;
+  for (const auto& lc : config.layer_configs) {
+    if (lc.qkv_dim > max_dim) max_dim = HWY_MAX(max_dim, lc.qkv_dim);
+  }
+  return max_dim;
+}
+
 static inline float ChooseQueryScale(const ModelConfig& config) {
   const LayerConfig& layer_config = config.layer_configs[0];
   if (config.query_scale == QueryScaleType::SqrtModelDimDivNumHeads)
     return 1.0f /
            sqrtf(static_cast<float>(config.model_dim / layer_config.heads));
+  if (config.query_scale == QueryScaleType::One)
+    return 1.0f;
   // QueryScaleType::SqrtKeySize
   return 1.0f / sqrtf(static_cast<float>(layer_config.qkv_dim));
 }
@@ -57,6 +67,7 @@ struct AttentionActivations {
       std::vector<hwy::AlignedFreeUniquePtr<uint8_t*[]>>& row_ptrs)
       : heads(layer_config.heads),
         qkv_dim(layer_config.qkv_dim),
+        max_qkv_dim(MaxQkvDim(config)),
         rep_factor(max_workers *
                    AttentionActivations::kThreadReplicationFactor /
                    layer_config.heads),
@@ -64,32 +75,33 @@ struct AttentionActivations {
         // is still MHA and does not use an external KV cache.
         q(MatFactory("q", batch_size,
                      config.vocab_size == 0
-                         ? layer_config.heads * 3 * layer_config.qkv_dim
-                         : layer_config.heads * layer_config.qkv_dim,
+                         ? layer_config.heads * 3 * max_qkv_dim
+                         : layer_config.heads * max_qkv_dim,
                      allocator)),
         q_bf(MatFactory("q_bf", batch_size,
                         config.vocab_size == 0
-                            ? layer_config.heads * 3 * layer_config.qkv_dim
-                            : layer_config.heads * layer_config.qkv_dim,
+                            ? layer_config.heads * 3 * max_qkv_dim
+                            : layer_config.heads * max_qkv_dim,
                         allocator)),
-        vit_Q(MatFactory("Q2", batch_size, layer_config.qkv_dim, allocator)),
+
+        vit_Q(MatFactory("Q2", batch_size, max_qkv_dim, allocator)),
         vit_K_T(MatFactory(
             "K2_T", hwy::RoundUpTo(seq_len, kMaxBF16PerVector),
             layer_config.heads *
-                hwy::RoundUpTo(layer_config.qkv_dim, kMaxBF16PerVector),
+                hwy::RoundUpTo(max_qkv_dim, kMaxBF16PerVector),
             allocator, MatPadding::kPacked)),
         vit_V_T(MatFactory(
             "V2_T", hwy::RoundUpTo(seq_len, kMaxBF16PerVector),
             layer_config.heads *
-                hwy::RoundUpTo(layer_config.qkv_dim, kMaxBF16PerVector),
+                hwy::RoundUpTo(max_qkv_dim, kMaxBF16PerVector),
             allocator, MatPadding::kPacked)),
         pre_att_rms_out(MatFactory("pre_att_rms_out", batch_size,
                                    config.model_dim, allocator)),
         att_out(MatFactory("att_out", batch_size,
-                           layer_config.heads * layer_config.qkv_dim,
+                           layer_config.heads * max_qkv_dim,
                            allocator)),
         att_out_reps(MatFactory("att_out", batch_size * rep_factor,
-                                layer_config.heads * layer_config.qkv_dim,
+                                layer_config.heads * max_qkv_dim,
                                 allocator)),
         softmax_max(MatFactory("softmax_max", batch_size, layer_config.heads,
                                allocator)),
@@ -102,8 +114,12 @@ struct AttentionActivations {
             CreateInvTimescale(allocator, layer_config.qkv_dim,
                                layer_config.post_qk == PostQKType::HalfRope)),
         inv_timescale_global(CreateInvTimescale(
-            allocator, layer_config.qkv_dim,
-            layer_config.post_qk == PostQKType::HalfRope, 1000000.0)) {
+            allocator,
+            config.partial_rotary_factor < 1.0f
+                ? max_qkv_dim
+                : max_qkv_dim / 4,
+            layer_config.post_qk == PostQKType::HalfRope, 1000000.0,
+            config.partial_rotary_factor)) {
     // Batch size can be 0 in experimental code so do not assert.
     if (batch_size == 0) {
       static std::atomic_flag warned = ATOMIC_FLAG_INIT;
@@ -148,6 +164,7 @@ struct AttentionActivations {
 
   size_t heads;
   size_t qkv_dim;
+  size_t max_qkv_dim;
   AlignedBF16Vector bf16_queries;
   std::vector<int16_t, hwy::AlignedAllocator<int16_t>> int16_queries;
   AlignedFloatVector float_queries;

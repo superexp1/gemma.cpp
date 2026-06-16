@@ -346,9 +346,9 @@ void TestFlashAttention(size_t target_parallelism,
   const size_t kHeadGroups = layer_config.heads / layer_config.kv_heads;
   const size_t seq_len =
       static_cast<size_t>(att_activations.div_seq_len.GetDivisor());
-  MaybeReshapeCache(qbatch.KV(0).cache->KOrVDefaultCols(),
+  MaybeReshapeCache(qbatch.KV(0).cache->k_v_cols,
                     qbatch.KV(0).k_cache);
-  MaybeReshapeCache(qbatch.KV(0).cache->KOrVDefaultCols(),
+  MaybeReshapeCache(qbatch.KV(0).cache->k_v_cols,
                     qbatch.KV(0).v_cache);
   auto& kvc = qbatch.KV(0).kv_cache;
   using DF = hn::ScalableTag<float>;

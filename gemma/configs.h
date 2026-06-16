@@ -126,6 +126,7 @@ static inline bool EnumValid(PostNormType type) {
 enum class PostQKType {
   Rope,
   HalfRope,
+  NormLocalRope = 8,  // Norm without scale, and rope for local attention layers
   kSentinel  // must be last
 };
 
@@ -149,6 +150,7 @@ static inline bool EnumValid(ActivationType type) {
 enum class QueryScaleType {
   SqrtKeySize,
   SqrtModelDimDivNumHeads,
+  One,
   kSentinel  // must be last
 };
 
@@ -214,6 +216,7 @@ enum class Model {
   GEMMA3_4B_LM,
   GEMMA3_12B_LM,
   GEMMA3_27B_LM,
+  GEMMA4_26B_MOE,
   kSentinel,
 };
 
@@ -292,9 +295,17 @@ struct LayerConfig : public IFields {
     visitor(activation);
     visitor(post_qk);
     visitor(use_qk_norm);
+    visitor(norm_v);
+    visitor(num_experts);
+    visitor(num_experts_per_datapoint);
     internal.VisitFields(visitor);
     // Append new fields here, then update `python/configs.cc`.
   }
+
+  uint32_t NumExperts() const { return num_experts; }
+  uint32_t NumExpertsPerDatapoint() const { return num_experts_per_datapoint; }
+
+  bool IsMoE() const { return NumExperts() > 0; }
 
   // Returns whether all fields match.
   bool TestEqual(const LayerConfig& other, bool print) const;
@@ -316,6 +327,9 @@ struct LayerConfig : public IFields {
   ActivationType activation = ActivationType::Gelu;
   PostQKType post_qk = PostQKType::Rope;
   bool use_qk_norm = false;
+  bool norm_v = false;  // Normalize V projections before caching.
+  uint32_t num_experts = 0;
+  uint32_t num_experts_per_datapoint = 0;
   InternalLayerConfig internal;
 };
 
@@ -414,6 +428,7 @@ struct ModelConfig : public IFields {
     internal.VisitFields(visitor);
 
     visitor(use_global_timescale);
+    visitor(partial_rotary_factor);
 
     // Append new fields here, then update `python/configs.cc`.
   }
@@ -475,8 +490,11 @@ struct ModelConfig : public IFields {
   }
 
   size_t KVCacheCols() const {
-    const size_t num_layers = layer_configs.size();
-    return num_layers * layer_configs[0].CacheLayerSize();
+    size_t cols = 0;
+    for (const auto& lc : layer_configs) {
+      cols += lc.CacheLayerSize();
+    }
+    return cols;
   }
 
   bool IsEOS(int id) const { return (id == eos_id || id == secondary_eos_id); }
@@ -526,6 +544,7 @@ struct ModelConfig : public IFields {
 
   InternalModelConfig internal;
   bool use_global_timescale = false;  // for Gemma 3
+  float partial_rotary_factor = 1.0f;  // Fraction of dims with RoPE (0.25 for Gemma4 MoE).
 };
 
 // Returns the sub-config for the ViT model of the PaliGemma model.

@@ -16,9 +16,11 @@
 #ifndef THIRD_PARTY_GEMMA_CPP_GEMMA_WEIGHTS_H_
 #define THIRD_PARTY_GEMMA_CPP_GEMMA_WEIGHTS_H_
 
+#include <math.h>  // isnan
 #include <stddef.h>
 #include <stdint.h>
 
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -88,6 +90,14 @@ class MatFinder {
   const TensorInfoRegistry& tensors_;
 };
 
+// Stores pre-converted float min/max for clamping activations. The BF16->float
+// conversion happens once at load time in Fixup(), not at every inference call.
+struct ClampRange {
+  float min = std::numeric_limits<float>::quiet_NaN();
+  float max = std::numeric_limits<float>::quiet_NaN();
+  bool IsActive() const { return !isnan(min) && !isnan(max); }
+};
+
 // Per-layer weight metadata and pointers. The tensor data is owned by
 // `MatOwner`.
 struct LayerWeightsPtrs {
@@ -123,6 +133,7 @@ struct LayerWeightsPtrs {
         pre_ffw_norm_scale(finder_("pre_ff_ns")),
         post_attention_norm_scale(finder_("post_att_ns")),
         post_ffw_norm_scale(finder_("post_ff_ns")),
+        skip_scale(finder_("skip_scale")),
         ffw_gating_biases(finder_("ffw_gat_b")),
         ffw_output_biases(finder_("ffw_out_b")),
 
@@ -132,7 +143,43 @@ struct LayerWeightsPtrs {
         key_norm_scale(finder_("key_norm")),
         query_norm_scale(finder_("query_norm")),
 
+        router_scale(finder_("router_scale")),
+        p_expert_sc(finder_("p_expert_sc")),
+        post_ffw1_ns(finder_("post_ffw1_ns")),
+        post_ffw2_ns(finder_("post_ffw2_ns")),
+        pre_ffw2_ns(finder_("pre_ffw2_ns")),
+        qc_in_min_matptr(finder_("qc_in_min")),
+        qc_in_max_matptr(finder_("qc_in_max")),
+        qc_out_min_matptr(finder_("qc_out_min")),
+        qc_out_max_matptr(finder_("qc_out_max")),
+        kvc_in_min_matptr(finder_("kvc_in_min")),
+        kvc_in_max_matptr(finder_("kvc_in_max")),
+        kvc_out_min_matptr(finder_("kvc_out_min")),
+        kvc_out_max_matptr(finder_("kvc_out_max")),
+        aoc_in_min_matptr(finder_("aoc_in_min")),
+        aoc_in_max_matptr(finder_("aoc_in_max")),
+        aoc_out_min_matptr(finder_("aoc_out_min")),
+        aoc_out_max_matptr(finder_("aoc_out_max")),
+        gtc_in_min_matptr(finder_("gtc_in_min")),
+        gtc_in_max_matptr(finder_("gtc_in_max")),
+        gtc_out_min_matptr(finder_("gtc_out_min")),
+        gtc_out_max_matptr(finder_("gtc_out_max")),
+        linc_in_min_matptr(finder_("linc_in_min")),
+        linc_in_max_matptr(finder_("linc_in_max")),
+        linc_out_min_matptr(finder_("linc_out_min")),
+        linc_out_max_matptr(finder_("linc_out_max")),
+        moe_router(finder_("moe_router")),
+
         layer_config(config) {
+    if (layer_config.IsMoE()) {
+      for (uint32_t i = 0; i < layer_config.NumExperts(); ++i) {
+        const std::string moe_suffix = MoESuffix(layer_idx, i);
+        MatFinder moe_finder(moe_suffix, tensors);
+        moe_gating_einsum_w1.emplace_back(moe_finder("gating1_w"));
+        moe_gating_einsum_w2.emplace_back(moe_finder("gating2_w"));
+        moe_linear_w.emplace_back(moe_finder("linear_w"));
+      }
+    }
   }
   ~LayerWeightsPtrs() = default;
 
@@ -174,6 +221,7 @@ struct LayerWeightsPtrs {
   MatPtr pre_ffw_norm_scale;         // at least BF16.
   MatPtr post_attention_norm_scale;  // at least BF16.
   MatPtr post_ffw_norm_scale;        // at least BF16.
+  MatPtr skip_scale;                 // at least BF16.
 
   MatPtrT<float> ffw_gating_biases;
   MatPtrT<float> ffw_output_biases;
@@ -183,6 +231,28 @@ struct LayerWeightsPtrs {
 
   MatPtr key_norm_scale;    // at least BF16.
   MatPtr query_norm_scale;  // at least BF16.
+  
+  MatPtr router_scale;
+  MatPtr p_expert_sc;
+  MatPtr post_ffw1_ns;
+  MatPtr post_ffw2_ns;
+  MatPtr pre_ffw2_ns;
+  // Clamping ranges, converted from BF16 MatPtrs at load time in Fixup().
+  ClampRange qc_in;     // query clamp input
+  ClampRange qc_out;    // query clamp output
+  ClampRange kvc_in;    // KV clamp input
+  ClampRange kvc_out;   // KV clamp output
+  ClampRange aoc_in;    // attention output clamp input
+  ClampRange aoc_out;   // attention output clamp output
+  ClampRange gtc_in;    // gating clamp input
+  ClampRange gtc_out;   // gating clamp output
+  ClampRange linc_in;   // linear clamp input
+  ClampRange linc_out;  // linear clamp output
+
+  MatPtr moe_router;
+  std::vector<MatPtr> moe_gating_einsum_w1;
+  std::vector<MatPtr> moe_gating_einsum_w2;
+  std::vector<MatPtr> moe_linear_w;
 
   const LayerConfig& layer_config;
 
@@ -228,6 +298,7 @@ struct LayerWeightsPtrs {
       func(TENSOR_ARGS(linear_w, kMaybeRead));
       func(TENSOR_ARGS(pre_attention_norm_scale, kMustRead));
       func(TENSOR_ARGS(pre_ffw_norm_scale, kMustRead));
+      func(TENSOR_ARGS(skip_scale, kMaybeRead));
     }
 
     if (layer_config.post_norm == PostNormType::Scale) {
@@ -238,6 +309,40 @@ struct LayerWeightsPtrs {
       func(TENSOR_ARGS(key_norm_scale, kMustRead));
       func(TENSOR_ARGS(query_norm_scale, kMustRead));
     }
+    if (layer_config.IsMoE()) {
+      func(TENSOR_ARGS(moe_router, kMustRead));
+      func(TENSOR_ARGS(router_scale, kMustRead));
+      func(TENSOR_ARGS(p_expert_sc, kMustRead));
+      func(TENSOR_ARGS(post_ffw1_ns, kMustRead));
+      func(TENSOR_ARGS(post_ffw2_ns, kMustRead));
+      func(TENSOR_ARGS(pre_ffw2_ns, kMustRead));
+      for (uint32_t i = 0; i < layer_config.NumExperts(); ++i) {
+        func(TENSOR_ARGS(moe_gating_einsum_w1[i], kMustRead));
+        func(TENSOR_ARGS(moe_gating_einsum_w2[i], kMustRead));
+        func(TENSOR_ARGS(moe_linear_w[i], kMustRead));
+      }
+    }
+
+    func(TENSOR_ARGS(qc_in_min_matptr, TensorArgs::kMaybeRead));
+    func(TENSOR_ARGS(qc_in_max_matptr, TensorArgs::kMaybeRead));
+    func(TENSOR_ARGS(qc_out_min_matptr, TensorArgs::kMaybeRead));
+    func(TENSOR_ARGS(qc_out_max_matptr, TensorArgs::kMaybeRead));
+    func(TENSOR_ARGS(kvc_in_min_matptr, TensorArgs::kMaybeRead));
+    func(TENSOR_ARGS(kvc_in_max_matptr, TensorArgs::kMaybeRead));
+    func(TENSOR_ARGS(kvc_out_min_matptr, TensorArgs::kMaybeRead));
+    func(TENSOR_ARGS(kvc_out_max_matptr, TensorArgs::kMaybeRead));
+    func(TENSOR_ARGS(aoc_in_min_matptr, TensorArgs::kMaybeRead));
+    func(TENSOR_ARGS(aoc_in_max_matptr, TensorArgs::kMaybeRead));
+    func(TENSOR_ARGS(aoc_out_min_matptr, TensorArgs::kMaybeRead));
+    func(TENSOR_ARGS(aoc_out_max_matptr, TensorArgs::kMaybeRead));
+    func(TENSOR_ARGS(gtc_in_min_matptr, TensorArgs::kMaybeRead));
+    func(TENSOR_ARGS(gtc_in_max_matptr, TensorArgs::kMaybeRead));
+    func(TENSOR_ARGS(gtc_out_min_matptr, TensorArgs::kMaybeRead));
+    func(TENSOR_ARGS(gtc_out_max_matptr, TensorArgs::kMaybeRead));
+    func(TENSOR_ARGS(linc_in_min_matptr, TensorArgs::kMaybeRead));
+    func(TENSOR_ARGS(linc_in_max_matptr, TensorArgs::kMaybeRead));
+    func(TENSOR_ARGS(linc_out_min_matptr, TensorArgs::kMaybeRead));
+    func(TENSOR_ARGS(linc_out_max_matptr, TensorArgs::kMaybeRead));
 
     if (layer_config.ff_biases) {
       func(TENSOR_ARGS(ffw_gating_biases, kMustRead));
@@ -256,9 +361,33 @@ struct LayerWeightsPtrs {
   // Must be called after reading weights via `ForEachTensor`.
   // TODO: exporters should bake this into the weights already.
   // WARNING: called from multiple threads; `mat_owners` requires a lock.
-  void Fixup(std::vector<MatOwner>& mat_owners, ThreadingContext& ctx);
+  void Fixup(Model model, std::vector<MatOwner>& mat_owners,
+             ThreadingContext& ctx);
 
  private:
+  // Load-time-only MatPtrs for clamp scalars. Converted to ClampRange floats
+  // in Fixup(), then only ClampRange members are used at inference time.
+  MatPtr qc_in_min_matptr;
+  MatPtr qc_in_max_matptr;
+  MatPtr qc_out_min_matptr;
+  MatPtr qc_out_max_matptr;
+  MatPtr kvc_in_min_matptr;
+  MatPtr kvc_in_max_matptr;
+  MatPtr kvc_out_min_matptr;
+  MatPtr kvc_out_max_matptr;
+  MatPtr aoc_in_min_matptr;
+  MatPtr aoc_in_max_matptr;
+  MatPtr aoc_out_min_matptr;
+  MatPtr aoc_out_max_matptr;
+  MatPtr gtc_in_min_matptr;
+  MatPtr gtc_in_max_matptr;
+  MatPtr gtc_out_min_matptr;
+  MatPtr gtc_out_max_matptr;
+  MatPtr linc_in_min_matptr;
+  MatPtr linc_in_max_matptr;
+  MatPtr linc_out_min_matptr;
+  MatPtr linc_out_max_matptr;
+
   // Copies att_weights from `attn_vec_einsum_w`.
   void InitAttWeights(std::vector<MatOwner>& mat_owners,
                       const Allocator& allocator);

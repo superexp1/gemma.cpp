@@ -150,6 +150,30 @@ void PostNorm(PostNormType post_norm, const MatPtr& weights,
   if (post_norm == PostNormType::Scale) {
     RMSNormInplaceBatched(weights, inout, ctx);
   }
+  if (post_norm == PostNormType::NoScale) {
+    RMSNormNoScaleInplaceBatched(inout, ctx);
+  }
+}
+
+template <typename T>
+static inline void ClampInplace(const ClampRange& range, MatPtrT<T>& inout) {
+  if (!range.IsActive()) return;
+  namespace hn = hwy::HWY_NAMESPACE;
+  using DF = hn::ScalableTag<float>;
+  using VF = hn::Vec<DF>;
+
+  const VF vlo = hn::Set(DF(), range.min);
+  const VF vhi = hn::Set(DF(), range.max);
+  const VF* HWY_RESTRICT plo = &vlo;
+  const VF* HWY_RESTRICT phi = &vhi;
+
+  for (size_t r = 0; r < inout.Rows(); ++r) {
+    DecompressAndCompressInplace(
+        DF(), inout.Row(r), inout.Cols(),
+        [plo, phi](DF /*df*/, VF v) HWY_ATTR -> VF {
+          return hn::Clamp(v, *plo, *phi);
+        });
+  }
 }
 
 static inline void FFWNoVit(const LayerWeightsPtrs& layer,
@@ -158,6 +182,8 @@ static inline void FFWNoVit(const LayerWeightsPtrs& layer,
   const LayerConfig& layer_config = layer.layer_config;
 
   HWY_DASSERT(!layer_config.ff_biases);  // Only used in Vit.
+
+  ClampInplace(layer.gtc_in, activations.pre_ffw_rms_out);
 
   activations.s_ffw_in.Notify(layer.layer_idx, activations.pre_ffw_rms_out,
                               env.ctx);
@@ -199,15 +225,19 @@ static HWY_INLINE void SumHeads(const LayerWeightsPtrs& layer,
   GCPP_ZONE(env.ctx, hwy::Profiler::GlobalIdx(), Zones::kGenAttentionSumHeads);
   const LayerConfig& layer_config = layer.layer_config;
   (void)layer_config;  // For HWY_DASSERT
-  // att_weights and att_out are concatenated heads, each of length
+    // att_weights and att_out are concatenated heads, each of length
   // layer_config.qkv_dim. Thus the [num_interleaved,
   // layer_config.model_dim] matmul output is the sum over heads. Compare
   // gemma/modules.py: attn_output = self.attn_vec_einsum('BTNH,NHD->BTD',
   // encoded)
   HWY_DASSERT(layer_config.model_dim != 0 && layer_config.heads != 0 &&
               layer_config.qkv_dim != 0);
+  ClampInplace(layer.aoc_in, activations.att_out);
+
   CallMatMul(activations.att_out, layer.att_weights, /*add=*/nullptr, env,
              activations.att_sums);
+
+  ClampInplace(layer.aoc_out, activations.att_sums);
 }
 
 // NOLINTNEXTLINE(google-readability-namespace-comments)
