@@ -18,10 +18,10 @@ deployment-oriented C++ inference runtimes, which are not designed for
 experimentation, and Python-centric ML research frameworks, which abstract away
 low-level computation through compilation.
 
-gemma.cpp provides a minimalist implementation of Gemma-2, Gemma-3, and
-PaliGemma-2 models, focusing on simplicity and directness rather than full
-generality. This is inspired by vertically-integrated model implementations such
-as [ggml](https://github.com/ggerganov/ggml),
+gemma.cpp provides a minimalist implementation of Gemma-2, Gemma-3, Gemma-4
+MoE, and PaliGemma-2 models, focusing on simplicity and directness rather than
+full generality. This is inspired by vertically-integrated model implementations
+such as [ggml](https://github.com/ggerganov/ggml),
 [llama.c](https://github.com/karpathy/llama2.c), and
 [llama.rs](https://github.com/srush/llama2.rs).
 
@@ -53,7 +53,7 @@ Guidelines](https://opensource.google.com/conduct/).
 
 -   LLM
 
-    -   CPU-only inference for: Gemma 2-3, PaliGemma 2.
+    -   CPU-only inference for: Gemma 2-3, Gemma 4 MoE, PaliGemma 2.
     -   Sampling with TopK and temperature.
 
 -   Optimizations
@@ -114,7 +114,8 @@ faster inference. In general, we recommend starting with the `-sfp` checkpoints.
 > [!NOTE] **Important**: We strongly recommend starting off with the
 > `gemma2-2b-it-sfp` model to get up and running.
 
-Gemma 2 models are named `gemma2-2b-it` for 2B and `9b-it` or `27b-it`. See the
+Gemma 2 models are named `gemma2-2b-it` for 2B and `9b-it` or `27b-it`. Gemma 4
+MoE support currently targets the `gemma4-26b-moe` text model. See the
 `ModelPrefix` function in `configs.cc`.
 
 ### Step 2: Extract Files
