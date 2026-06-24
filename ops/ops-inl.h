@@ -27,6 +27,12 @@
 #include <type_traits>  // std::enable_if_t
 #include <vector>
 
+#include "hwy/base.h"
+#include "hwy/bit_set.h"
+#include "hwy/contrib/sort/order.h"
+#include "hwy/contrib/sort/vqsort.h"
+#include "hwy/detect_targets.h"
+#include "hwy/profiler.h"
 #include "ops/matmul.h"
 #include "ops/ops.h"
 #include "util/allocator.h"
@@ -34,12 +40,6 @@
 #include "util/mat.h"
 #include "util/threading_context.h"
 #include "util/zones.h"
-#include "hwy/base.h"
-#include "hwy/bit_set.h"
-#include "hwy/contrib/sort/order.h"
-#include "hwy/contrib/sort/vqsort.h"
-#include "hwy/detect_targets.h"
-#include "hwy/profiler.h"
 #endif  // THIRD_PARTY_GEMMA_CPP_OPS_OPS_INL_H_
 
 // Include guard for (potentially) SIMD code.
@@ -51,12 +51,12 @@
 #endif
 
 #include "compression/compress-inl.h"
-#include "ops/dot-inl.h"
-#include "ops/matmul_static.h"  // includes highway.h
-#include "ops/sum-inl.h"
 #include "hwy/contrib/algo/transform-inl.h"
 #include "hwy/contrib/math/fast_math-inl.h"
 #include "hwy/contrib/math/math-inl.h"
+#include "ops/dot-inl.h"
+#include "ops/matmul_static.h"  // includes highway.h
+#include "ops/sum-inl.h"
 
 HWY_BEFORE_NAMESPACE();
 namespace gcpp {
@@ -262,6 +262,46 @@ HWY_NOINLINE HWY_MAYBE_UNUSED void RMSNormInplace(
                                   const VF m = hn::Mul(*pmul, vx);
                                   // (1+weight) * m = m + weight*m = one FMA.
                                   return hn::MulAdd(m, vw, m);
+                                });
+}
+
+// Gemma 4 stores RMSNorm weights as direct scales. Earlier Gemma checkpoints
+// use the offset convention implemented by RMSNorm/RMSNormInplace above.
+template <typename XT, typename WT, typename OT>
+HWY_NOINLINE HWY_MAYBE_UNUSED void RMSNormDirectScale(
+    const XT* HWY_RESTRICT x, const WT* HWY_RESTRICT weight, const size_t w_ofs,
+    OT* HWY_RESTRICT out, const size_t size, ThreadingContext& ctx,
+    const size_t worker) {
+  GCPP_ZONE(ctx, worker, Zones::kOpsRmsNorm);
+
+  namespace hn = hwy::HWY_NAMESPACE;
+  using DF = hn::ScalableTag<float>;
+  using VF = hn::Vec<DF>;
+
+  const VF mul = hn::Set(DF(), detail::RMSNormMul(x, size, ctx, worker));
+  const VF* HWY_RESTRICT pmul = &mul;
+
+  Decompress2AndCompressTo(DF(), out, size, x, weight, w_ofs,
+                           [pmul](DF /*df*/, VF vx, VF vw) HWY_ATTR -> VF {
+                             return hn::Mul(hn::Mul(*pmul, vx), vw);
+                           });
+}
+
+template <typename WT, typename XT>
+HWY_NOINLINE HWY_MAYBE_UNUSED void RMSNormDirectScaleInplace(
+    const WT* HWY_RESTRICT weight, const size_t w_ofs, XT* HWY_RESTRICT inout,
+    const size_t size, ThreadingContext& ctx, const size_t worker) {
+  GCPP_ZONE(ctx, worker, Zones::kOpsRmsNormInplace);
+  namespace hn = hwy::HWY_NAMESPACE;
+  using DF = hn::ScalableTag<float>;
+  using VF = hn::Vec<DF>;
+
+  const VF mul = hn::Set(DF(), detail::RMSNormMul(inout, size, ctx, worker));
+  const VF* HWY_RESTRICT pmul = &mul;
+
+  Decompress1AndCompressInplace(DF(), inout, size, weight, w_ofs,
+                                [pmul](DF /*df*/, VF vx, VF vw) HWY_ATTR -> VF {
+                                  return hn::Mul(hn::Mul(*pmul, vx), vw);
                                 });
 }
 
@@ -515,6 +555,25 @@ void RMSNormBatched(const MatPtrT<XT>& activations, const MatPtr& weights,
   });
 }
 
+template <typename XT, typename OT>
+void RMSNormDirectScaleBatched(const MatPtrT<XT>& activations,
+                               const MatPtr& weights, MatPtrT<OT>& out,
+                               ThreadingContext& ctx, size_t cluster_idx = 0) {
+  HWY_DASSERT(weights.Rows() == 1);
+  HWY_DASSERT(weights.Cols() == activations.Cols());
+  activations.DebugCheckSameShape(out);
+
+  CallUpcasted(&weights, [&](const auto* weights_t) {
+    ParallelFor(
+        Parallelism::kFlat, activations.Rows(), ctx, cluster_idx,
+        Callers::kOpsRMSNormBatched, [&](uint64_t token_idx, size_t worker) {
+          RMSNormDirectScale(
+              activations.Row(token_idx), weights_t->PackedScale1(),
+              /*w_ofs=*/0, out.Row(token_idx), activations.Cols(), ctx, worker);
+        });
+  });
+}
+
 template <typename XT>
 void RMSNormInplaceBatched(const MatPtr& weights, MatPtrT<XT>& inout,
                            ThreadingContext& ctx, size_t cluster_idx = 0) {
@@ -528,6 +587,24 @@ void RMSNormInplaceBatched(const MatPtr& weights, MatPtrT<XT>& inout,
                   RMSNormInplace(weights_t->PackedScale1(), /*w_ofs=*/0,
                                  inout.Row(token_idx), inout.Cols(), ctx,
                                  worker);
+                });
+  });
+}
+
+template <typename XT>
+void RMSNormDirectScaleInplaceBatched(const MatPtr& weights, MatPtrT<XT>& inout,
+                                      ThreadingContext& ctx,
+                                      size_t cluster_idx = 0) {
+  HWY_DASSERT(weights.Rows() == 1);
+  HWY_DASSERT(weights.Cols() == inout.Cols());
+
+  CallUpcasted(&weights, [&](const auto* weights_t) {
+    ParallelFor(Parallelism::kFlat, inout.Rows(), ctx, cluster_idx,
+                Callers::kOpsRMSNormInplaceBatched,
+                [&](uint64_t token_idx, size_t worker) {
+                  RMSNormDirectScaleInplace(weights_t->PackedScale1(),
+                                            /*w_ofs=*/0, inout.Row(token_idx),
+                                            inout.Cols(), ctx, worker);
                 });
   });
 }
@@ -669,10 +746,9 @@ static HWY_NOINLINE void GroupedRMSNormInplace(
 }
 
 template <typename XT, typename OT>
-void RMSNormNoScaleBatched(
-    const MatPtrT<XT>& in, MatPtrT<OT>& out, ThreadingContext& ctx,
-    size_t cluster_idx = 0,
-    Parallelism parallelism = Parallelism::kFlat) {
+void RMSNormNoScaleBatched(const MatPtrT<XT>& in, MatPtrT<OT>& out,
+                           ThreadingContext& ctx, size_t cluster_idx = 0,
+                           Parallelism parallelism = Parallelism::kFlat) {
   ParallelFor(parallelism, in.Rows(), ctx, cluster_idx,
               Callers::kOpsRMSNormNoScaleBatched,
               [&](uint64_t token_idx, size_t worker) {
@@ -695,10 +771,11 @@ void RMSNormNoScaleInplaceBatched(
 }
 
 template <typename XT, typename OT>
-void GroupedRMSNormBatched(
-    const MatPtrT<XT>& activations, const MatPtr& weights, MatPtrT<OT>& out,
-    const size_t num_groups, ThreadingContext& ctx, size_t cluster_idx = 0,
-    Parallelism parallelism = Parallelism::kFlat) {
+void GroupedRMSNormBatched(const MatPtrT<XT>& activations,
+                           const MatPtr& weights, MatPtrT<OT>& out,
+                           const size_t num_groups, ThreadingContext& ctx,
+                           size_t cluster_idx = 0,
+                           Parallelism parallelism = Parallelism::kFlat) {
   CallUpcasted(&weights, [&](const auto* weights_t) {
     ParallelFor(parallelism, activations.Rows(), ctx, cluster_idx,
                 Callers::kOpsGroupedRMSNormBatched,

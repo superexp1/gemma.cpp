@@ -29,13 +29,13 @@
 #include "gemma/configs.h"
 #include "gemma/gemma_args.h"
 #include "gemma/model_store.h"
+#include "hwy/base.h"
+#include "hwy/highway.h"
+#include "hwy/profiler.h"
 #include "io/blob_store.h"
 #include "util/mat.h"
 #include "util/threading_context.h"
 #include "util/zones.h"
-#include "hwy/base.h"
-#include "hwy/highway.h"
-#include "hwy/profiler.h"
 
 // TODO: move into foreach_target
 #include "compression/compress-inl.h"
@@ -89,7 +89,10 @@ void LayerWeightsPtrs::InitAttWeights(std::vector<MatOwner>& mat_owners,
 void LayerWeightsPtrs::SplitW1() {
   // Used for Gemma layers; FFWVit uses different tensors.
   if (layer_config.type == LayerAttentionType::kVit) return;
-  if (layer_config.IsMoE()) return;
+  if (layer_config.IsMoE() && !gating_einsum_w.HasPtr() &&
+      !gating_einsum_w1.HasPtr()) {
+    return;
+  }
 
   // Files have both or neither of w1 and w2.
   HWY_ASSERT(gating_einsum_w1.HasPtr() == gating_einsum_w2.HasPtr());
@@ -374,8 +377,7 @@ static void HWY_MAYBE_UNUSED SplitAttW1I8(const LayerConfig& layer_config,
 // Must be called after reading weights via `ForEachTensor`.
 // TODO: exporters should bake this into the weights already.
 // WARNING: called from multiple threads; `mat_owners` requires a lock.
-void LayerWeightsPtrs::Fixup(Model model,
-                             std::vector<MatOwner>& mat_owners,
+void LayerWeightsPtrs::Fixup(Model model, std::vector<MatOwner>& mat_owners,
                              ThreadingContext& ctx) {
   if (attn_vec_einsum_w.GetType() == Type::kI8) {
     MatPtrT<I8Stream> attn_vec_einsum_w_i8(attn_vec_einsum_w);
@@ -412,40 +414,6 @@ void LayerWeightsPtrs::Fixup(Model model,
     qkv_einsum_w2 = qkv_einsum_w2_i8;
   } else {
     SplitAttW1();
-    // Interleave K/V heads in qkv_einsum_w2: the exporter writes
-    // [K0..Kn, V0..Vn] but the runtime expects [K0, V0, K1, V1, ...].
-    // TODO(philculliton): either (1) fix the exporter to emit interleaved
-    // layout directly, or (2) replace this model check with a general
-    // structural condition (e.g. !IsMHA() && kv_heads > 1) once we
-    // verify it doesn't regress other multi-kv-head models.
-    // This applies to Gemma 4 global layers; the model check will be expanded.
-    if (model == Model::GEMMA4_26B_MOE &&
-        layer_config.kv_heads == 2 && layer_config.qkv_dim == 512) {
-      const size_t row_bytes =
-          qkv_einsum_w2.Stride() * qkv_einsum_w2.ElementBytes();
-      const size_t kv_heads = layer_config.kv_heads;
-      const size_t total_bytes = qkv_einsum_w2.Rows() * row_bytes;
-      hwy::AlignedFreeUniquePtr<uint8_t[]> tmp =
-          hwy::AllocateAligned<uint8_t>(total_bytes);
-      hwy::CopyBytes(qkv_einsum_w2.RowBytes(0), tmp.get(), total_bytes);
-
-      {
-        mat_owners.emplace_back();
-        mat_owners.back().AllocateFor(qkv_einsum_w2, ctx.allocator,
-                                      MatPadding::kPacked);
-      }
-
-      const size_t qkv_dim = layer_config.qkv_dim;
-      const size_t head_bytes = qkv_dim * row_bytes;
-      const uint8_t* src_ptr = tmp.get();
-      for (size_t i = 0; i < kv_heads; ++i) {
-        hwy::CopyBytes(src_ptr + i * head_bytes,
-                       qkv_einsum_w2.RowBytes(2 * i * qkv_dim), head_bytes);
-        hwy::CopyBytes(src_ptr + (kv_heads + i) * head_bytes,
-                       qkv_einsum_w2.RowBytes((2 * i + 1) * qkv_dim),
-                       head_bytes);
-      }
-    }
   }
 
   // Convert BF16 clamp scalars to float ClampRange, validated once here.
@@ -708,8 +676,8 @@ static void ReadAllToBF16(const std::vector<TensorToRead>& tensors,
                 const TensorToRead& tensor = tensors[task];
                 MatPtr& mat = *tensor.mat;
                 // Validate blob size matches allocated buffer before any read.
-                // MapAll (line ~557) and MakeBatches (line ~645) both assert this;
-                // this path was the only one missing the check.
+                // MapAll (line ~557) and MakeBatches (line ~645) both assert
+                // this; this path was the only one missing the check.
                 HWY_ASSERT_M(tensor.range.bytes == tensor.prev_packed_bytes,
                              mat.Name());
 

@@ -26,10 +26,10 @@
 #include <vector>
 
 #include "compression/types.h"  // Type
-#include "io/fields.h"          // IFieldsVisitor
-#include "io/io.h"              // Path
-#include "util/basics.h"
 #include "hwy/detect_compiler_arch.h"
+#include "io/fields.h"  // IFieldsVisitor
+#include "io/io.h"      // Path
+#include "util/basics.h"
 
 namespace gcpp {
 
@@ -114,6 +114,7 @@ AttentionImpl GetAttentionImpl(const std::string& impl);
 enum class PostNormType {
   None,
   Scale,
+  NoScale,
   kSentinel  // must be last
 };
 
@@ -127,12 +128,11 @@ enum class PostQKType {
   Rope,
   HalfRope,
   NormLocalRope = 8,  // Norm without scale, and rope for local attention layers
-  kSentinel  // must be last
+  kSentinel           // must be last
 };
 
 static inline bool EnumValid(PostQKType type) {
-  return static_cast<size_t>(type) <
-         static_cast<size_t>(PostNormType::kSentinel);
+  return static_cast<size_t>(type) < static_cast<size_t>(PostQKType::kSentinel);
 }
 
 // FFW activation function.
@@ -374,7 +374,10 @@ struct InternalModelConfig : public IFields {
   // Source of truth for field ordering.
   void VisitFields(IFieldsVisitor& visitor) override {
     // Append new fields here, then update `python/configs.cc`.
+    visitor(share_kv_cache);
   }
+
+  bool share_kv_cache = false;
 };
 
 struct ModelConfig : public IFields {
@@ -544,7 +547,8 @@ struct ModelConfig : public IFields {
 
   InternalModelConfig internal;
   bool use_global_timescale = false;  // for Gemma 3
-  float partial_rotary_factor = 1.0f;  // Fraction of dims with RoPE (0.25 for Gemma4 MoE).
+  float partial_rotary_factor =
+      1.0f;  // Fraction of dims with RoPE (0.25 for Gemma4 MoE).
 };
 
 // Returns the sub-config for the ViT model of the PaliGemma model.

@@ -60,15 +60,15 @@
 #include "gemma/configs.h"
 #include "gemma/model_store.h"
 #include "gemma/weights.h"
+#include "hwy/aligned_allocator.h"  // Span
+#include "hwy/base.h"
+#include "hwy/timer.h"
 #include "io/blob_store.h"
 #include "io/io.h"  // Path
 #include "ops/matmul.h"
 #include "paligemma/image.h"
 #include "util/basics.h"
 #include "util/threading_context.h"
-#include "hwy/aligned_allocator.h"  // Span
-#include "hwy/base.h"
-#include "hwy/timer.h"
 
 // Require opt-in to debug/introspection functions to eliminate their overhead.
 HWY_INLINE_VAR constexpr bool kObserver = false;
@@ -105,8 +105,8 @@ static HWY_NOINLINE void TransformerLayer(const size_t num_tokens,
   const LayerConfig& layer_config = layer.layer_config;
   if (layer_config.IsMoE() &&
       activations.attention.config.model == Model::GEMMA4_26B_MOE) {
-    Gemma4MoETransformerLayer(num_tokens, layer_idx, layer, activations,
-                              qbatch, env);
+    Gemma4MoETransformerLayer(num_tokens, layer_idx, layer, activations, qbatch,
+                              env);
     return;
   }
 
@@ -434,8 +434,13 @@ static void SampleAndStream(const ModelConfig& config,
                             TimingInfo& timing_info) {
   HWY_DASSERT(qbatch.Size() == activations.x.Rows());
 
-  RMSNormBatched(activations.x, weights.final_norm_scale, activations.x_bf,
-                 env.ctx);
+  if (config.model == Model::GEMMA4_26B_MOE) {
+    RMSNormDirectScaleBatched(activations.x, weights.final_norm_scale,
+                              activations.x_bf, env.ctx);
+  } else {
+    RMSNormBatched(activations.x, weights.final_norm_scale, activations.x_bf,
+                   env.ctx);
+  }
 
   MaybeObserve(runtime_config, activations, qbatch, -1);
 

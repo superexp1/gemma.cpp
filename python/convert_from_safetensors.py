@@ -88,7 +88,17 @@ def _is_float_param(param_name: str) -> bool:
 
 def _is_bf16_param(param_name: str) -> bool:
   """Returns whether the tensor should be stored as bf16."""
-  for prefix in ["pre_", "post_", "c_", "img_head_kernel"]:
+  for prefix in [
+      "pre_",
+      "post_",
+      "c_",
+      "img_head_kernel",
+      "query_norm",
+      "key_norm",
+      "router_scale",
+      "p_expert_sc",
+      "skip_scale",
+  ]:
     if param_name.startswith(prefix):
       return True
   return False
@@ -563,6 +573,9 @@ def export_gemma3_lm_sbs(
     )
 
   embed_tokens = params[f"{llm_prefix}embed_tokens.weight"]
+  if embed_tokens.shape[0] == 262208:
+    embed_tokens = embed_tokens[:262144]
+    params[f"{llm_prefix}embed_tokens.weight"] = embed_tokens
   vocab_size, model_dim = embed_tokens.shape
   hidden_dim = params[f"{llm_prefix}layers.0.mlp.gate_proj.weight"].shape[0]
   head_dim = 256  # Gemma 3 4B/12B/27B all use head_dim=256.
@@ -742,6 +755,312 @@ def export_gemma3_lm_sbs(
     csv.writer(csv_handle).writerows(metadata)
 
 
+def export_gemma4_moe_sbs(
+    model_specifier: str,
+    load_path: str,
+    tokenizer_file: str,
+    csv_file: str,
+    sbs_file: str,
+) -> None:
+  """Exports sbs file from a Gemma 4 MoE safetensors checkpoint."""
+
+  if load_path.endswith(".json"):
+    with open(load_path, "r") as f:
+      j_obj = json.load(f)
+    files = list(set(j_obj["weight_map"].values()))
+    files = [os.path.join(os.path.dirname(load_path), f) for f in files]
+  else:
+    files = [load_path]
+
+  params: Dict[str, Any] = {}
+  for file in files:
+    with safetensors.safe_open(file, framework="pt") as f:
+      for k in f.keys():
+        if "vision" in k:
+          continue
+        params[k] = f.get_tensor(k)
+
+  llm_prefix = "model.language_model."
+  if f"{llm_prefix}embed_tokens.weight" not in params:
+    if "model.embed_tokens.weight" in params:
+      llm_prefix = "model."
+    else:
+      raise ValueError("Could not locate embed_tokens.weight in checkpoint.")
+
+  embed_tokens = params[f"{llm_prefix}embed_tokens.weight"]
+  vocab_size, model_dim = embed_tokens.shape
+  num_layers = len(
+      set([k for k in params.keys() if k.endswith("input_layernorm.weight")])
+  )
+
+  experts_gate_up = params[f"{llm_prefix}layers.0.experts.gate_up_proj"]
+  num_experts, double_expert_hidden_dim, _ = experts_gate_up.shape
+  expert_hidden_dim = double_expert_hidden_dim // 2
+
+  hidden_dim = params[f"{llm_prefix}layers.0.mlp.gate_proj.weight"].shape[0]
+  head_dim = 256
+  q_proj = params[f"{llm_prefix}layers.0.self_attn.q_proj.weight"]
+  num_heads = q_proj.shape[0] // head_dim
+
+  print(
+      f"Gemma4 MoE: vocab={vocab_size} dim={model_dim} layers={num_layers} "
+      f"experts={num_experts} expert_hidden_dim={expert_hidden_dim} "
+      f"shared_mlp_hidden_dim={hidden_dim} heads={num_heads}"
+  )
+
+  writer = compression.SbsWriter(sbs_file)
+  metadata = []
+  scales = {}
+
+  def add_data(param_name, data, expected_shape, sbs_name, layer_index=None):
+    if not isinstance(expected_shape, tuple):
+      expected_shape = (expected_shape,)
+    print(f"Writing {param_name} with shape {data.shape} e:{expected_shape}")
+    assert data.shape == expected_shape, param_name
+
+    assert isinstance(data, torch.Tensor)
+    data = data.to(torch.float32).numpy()
+    data = np.array(data)
+
+    if layer_index is not None:
+      if isinstance(layer_index, tuple):
+        if "%d" in param_name:
+          param_name = param_name % layer_index[0]
+        param_name = param_name + f"_{layer_index[1]}"
+        sbs_name = sbs_name + f"_{layer_index[0]}_{layer_index[1]}"
+      else:
+        param_name = param_name % layer_index
+        sbs_name = sbs_name + f"_{layer_index}"
+
+    value = flatten_f32(data)
+    scale = compute_scale(value)
+    both_names = param_name + "::" + sbs_name
+    metadata.append((both_names, data.dtype, data.shape, scale))
+
+    if _is_float_param(sbs_name):
+      packed = configs.Type.kF32
+      print(f"Inserting {both_names} as float (f32) (no scaling)")
+    elif _is_bf16_param(sbs_name):
+      packed = configs.Type.kBF16
+      print(f"Inserting {both_names} as BF16 (no scaling)")
+    else:
+      packed = configs.Type.kSFP
+      assert scale == 1.0, f"Scale for {both_names} is not 1.0"
+      scales[sbs_name] = scale
+      print(f"Inserting {both_names} as SFP with scale {scale}")
+    sys.stdout.flush()
+
+    info = configs.TensorInfo()
+    info.name = sbs_name
+    info.shape = data.shape
+    writer.insert(sbs_name, value, packed, info)
+
+  def add_qkv_einsum(i, layer_head_dim):
+    q = params.pop(f"{llm_prefix}layers.{i}.self_attn.q_proj.weight")
+    k = params.pop(f"{llm_prefix}layers.{i}.self_attn.k_proj.weight")
+    v_key = f"{llm_prefix}layers.{i}.self_attn.v_proj.weight"
+    if v_key in params:
+      v = params.pop(v_key)
+    else:
+      v = k
+    n_kv = k.shape[0] // layer_head_dim
+    q = q.reshape(num_heads, layer_head_dim, model_dim)
+    k = k.reshape(n_kv, layer_head_dim, model_dim)
+    v = v.reshape(n_kv, layer_head_dim, model_dim)
+    stacked = torch.stack((k, v), dim=0)
+    transposed = stacked.transpose(0, 1)
+    reshaped = transposed.reshape(2 * n_kv, layer_head_dim, model_dim)
+    qkv = torch.cat([q, reshaped], dim=0)
+    add_data(
+        f"{llm_prefix}layers.%d.self_attn.qkv_proj.weight",
+        qkv,
+        (num_heads + 2 * n_kv, layer_head_dim, model_dim),
+        "qkv_ein",
+        i,
+    )
+
+  def add_att_einsum(i, layer_head_dim):
+    o = params.pop(f"{llm_prefix}layers.{i}.self_attn.o_proj.weight")
+    o = o.reshape(model_dim, num_heads, layer_head_dim).permute(1, 0, 2)
+    add_data(
+        f"{llm_prefix}layers.%d.self_attn.o_proj.weight",
+        o,
+        (num_heads, model_dim, layer_head_dim),
+        "att_ein",
+        i,
+    )
+
+  def add_gating_einsum(i):
+    gate = params.pop(f"{llm_prefix}layers.{i}.mlp.gate_proj.weight")
+    up = params.pop(f"{llm_prefix}layers.{i}.mlp.up_proj.weight")
+    assert gate.shape == up.shape == (hidden_dim, model_dim)
+    gating = torch.stack([gate, up], dim=0)
+    add_data(
+        f"{llm_prefix}layers.%d.mlp.gating_einsum.weight",
+        gating,
+        (2, hidden_dim, model_dim),
+        "gating_ein",
+        i,
+    )
+
+  # Non-layer tensors.
+  add_data(
+      f"{llm_prefix}embed_tokens.weight",
+      params.pop(f"{llm_prefix}embed_tokens.weight"),
+      (vocab_size, model_dim),
+      "c_embedding",
+  )
+  add_data(
+      f"{llm_prefix}norm.weight",
+      params.pop(f"{llm_prefix}norm.weight"),
+      (model_dim,),
+      "c_final_norm",
+  )
+
+  for i in range(num_layers):
+    layer_head_dim = 512 if (i % 6 == 5) else 256
+    add_att_einsum(i, layer_head_dim)
+    add_gating_einsum(i)
+    add_qkv_einsum(i, layer_head_dim)
+    add_data(
+        f"{llm_prefix}layers.%d.mlp.down_proj.weight",
+        params.pop(f"{llm_prefix}layers.{i}.mlp.down_proj.weight"),
+        (model_dim, hidden_dim),
+        "linear_w",
+        i,
+    )
+
+    add_data(
+        f"{llm_prefix}layers.%d.input_layernorm.weight",
+        params.pop(f"{llm_prefix}layers.{i}.input_layernorm.weight"),
+        (model_dim,),
+        "pre_att_ns",
+        i,
+    )
+    add_data(
+        f"{llm_prefix}layers.%d.post_attention_layernorm.weight",
+        params.pop(f"{llm_prefix}layers.{i}.post_attention_layernorm.weight"),
+        (model_dim,),
+        "post_att_ns",
+        i,
+    )
+    add_data(
+        f"{llm_prefix}layers.%d.pre_feedforward_layernorm.weight",
+        params.pop(f"{llm_prefix}layers.{i}.pre_feedforward_layernorm.weight"),
+        (model_dim,),
+        "pre_ff_ns",
+        i,
+    )
+    add_data(
+        f"{llm_prefix}layers.%d.post_feedforward_layernorm.weight",
+        params.pop(f"{llm_prefix}layers.{i}.post_feedforward_layernorm.weight"),
+        (model_dim,),
+        "post_ff_ns",
+        i,
+    )
+    add_data(
+        f"{llm_prefix}layers.%d.pre_feedforward_layernorm_2.weight",
+        params.pop(f"{llm_prefix}layers.{i}.pre_feedforward_layernorm_2.weight"),
+        (model_dim,),
+        "pre_ffw2_ns",
+        i,
+    )
+    add_data(
+        f"{llm_prefix}layers.%d.post_feedforward_layernorm_1.weight",
+        params.pop(f"{llm_prefix}layers.{i}.post_feedforward_layernorm_1.weight"),
+        (model_dim,),
+        "post_ffw1_ns",
+        i,
+    )
+    add_data(
+        f"{llm_prefix}layers.%d.post_feedforward_layernorm_2.weight",
+        params.pop(f"{llm_prefix}layers.{i}.post_feedforward_layernorm_2.weight"),
+        (model_dim,),
+        "post_ffw2_ns",
+        i,
+    )
+
+    add_data(
+        f"{llm_prefix}layers.%d.layer_scalar",
+        params.pop(f"{llm_prefix}layers.{i}.layer_scalar"),
+        (1,),
+        "skip_scale",
+        i,
+    )
+    add_data(
+        f"{llm_prefix}layers.%d.self_attn.q_norm.weight",
+        params.pop(f"{llm_prefix}layers.{i}.self_attn.q_norm.weight"),
+        (layer_head_dim,),
+        "query_norm",
+        i,
+    )
+    add_data(
+        f"{llm_prefix}layers.%d.self_attn.k_norm.weight",
+        params.pop(f"{llm_prefix}layers.{i}.self_attn.k_norm.weight"),
+        (layer_head_dim,),
+        "key_norm",
+        i,
+    )
+
+    add_data(
+        f"{llm_prefix}layers.%d.router.proj.weight",
+        params.pop(f"{llm_prefix}layers.{i}.router.proj.weight"),
+        (num_experts, model_dim),
+        "moe_router",
+        i,
+    )
+    add_data(
+        f"{llm_prefix}layers.%d.router.scale",
+        params.pop(f"{llm_prefix}layers.{i}.router.scale"),
+        (model_dim,),
+        "router_scale",
+        i,
+    )
+    add_data(
+        f"{llm_prefix}layers.%d.router.per_expert_scale",
+        params.pop(f"{llm_prefix}layers.{i}.router.per_expert_scale"),
+        (num_experts,),
+        "p_expert_sc",
+        i,
+    )
+
+    experts_gate_up_i = params.pop(f"{llm_prefix}layers.{i}.experts.gate_up_proj")
+    experts_down_i = params.pop(f"{llm_prefix}layers.{i}.experts.down_proj")
+    for j in range(num_experts):
+        gate_up_j = experts_gate_up_i[j]
+        gate_j = gate_up_j[:expert_hidden_dim, :]
+        up_j = gate_up_j[expert_hidden_dim:, :]
+        down_j = experts_down_i[j]
+
+        add_data(
+            f"{llm_prefix}layers.%d.experts.gate_proj",
+            gate_j,
+            (expert_hidden_dim, model_dim),
+            "gating1_w",
+            (i, j),
+        )
+        add_data(
+            f"{llm_prefix}layers.%d.experts.up_proj",
+            up_j,
+            (expert_hidden_dim, model_dim),
+            "gating2_w",
+            (i, j),
+        )
+        add_data(
+            f"{llm_prefix}layers.%d.experts.down_proj",
+            down_j,
+            (model_dim, expert_hidden_dim),
+            "linear_w",
+            (i, j),
+        )
+
+  if params:
+    print(f"WARNING: leftover params not consumed: {list(params.keys())[:10]}")
+
+  sbs_config = configs.ModelConfig(model_specifier)
+  writer.write(sbs_config, tokenizer_file)
+
+
 _MODEL_SPECIFIER = flags.DEFINE_string(
     "model_specifier",
     None,
@@ -798,10 +1117,14 @@ def main(argv: Sequence[str]) -> None:
     export_gemma3_lm_sbs(
         model_specifier, load_path, tokenizer_file, metadata_file, sbs_file
     )
+  elif model_specifier.startswith("gemma4-"):
+    export_gemma4_moe_sbs(
+        model_specifier, load_path, tokenizer_file, metadata_file, sbs_file
+    )
   else:
     raise app.UsageError(
         f"Unsupported model_specifier {model_specifier!r}. Expected a "
-        "'paligemma*' or 'gemma3-*-lm-*' specifier."
+        "'paligemma*', 'gemma3-*-lm-*', or 'gemma4-*' specifier."
     )
 
 

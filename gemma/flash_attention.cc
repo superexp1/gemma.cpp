@@ -28,18 +28,18 @@
 #include "gemma/flash_structs.h"
 #include "gemma/kv_cache.h"
 #include "gemma/query.h"
+#include "hwy/base.h"
 #include "util/basics.h"
 #include "util/threading_context.h"
 #include "util/zones.h"
-#include "hwy/base.h"
 #ifndef HWY_DISABLED_TARGETS
 #define HWY_DISABLED_TARGETS GEMMA_DISABLED_TARGETS
 #endif  // HWY_DISABLED_TARGETS
 
 #include "gemma/activations.h"
 #include "gemma/configs.h"  // kMaxQKVDim
-#include "util/threading.h"
 #include "hwy/profiler.h"
+#include "util/threading.h"
 
 // Compiles this file for multiple architectures via "foreach_target.h", to
 // which we pass the filename via macro 'argument'.
@@ -52,9 +52,9 @@
 // After highway.h
 #include "compression/compress-inl.h"
 #include "gemma/attention.h"
+#include "hwy/contrib/math/fast_math-inl.h"
 #include "ops/matmul-inl.h"
 #include "ops/ops-inl.h"
-#include "hwy/contrib/math/fast_math-inl.h"
 
 HWY_BEFORE_NAMESPACE();
 namespace gcpp {
@@ -86,8 +86,13 @@ void RMSNormAndPositionalEncoding(const size_t num_tokens, const QBatch& qbatch,
       // Apply rope and scaling to Q.
       if (query_norm_scale.HasPtr()) {
         CallUpcasted(&query_norm_scale, [&](const auto* weights_t) {
-          RMSNormInplace(weights_t->PackedScale1(), /*w_ofs=*/0, q_row,
-                         layer_config.qkv_dim, ctx, worker);
+          if (activations.config.model == Model::GEMMA4_26B_MOE) {
+            RMSNormDirectScaleInplace(weights_t->PackedScale1(), /*w_ofs=*/0,
+                                      q_row, layer_config.qkv_dim, ctx, worker);
+          } else {
+            RMSNormInplace(weights_t->PackedScale1(), /*w_ofs=*/0, q_row,
+                           layer_config.qkv_dim, ctx, worker);
+          }
         });
       }
       PositionalEncodingQK(q_row, layer_idx, activations, ctx, worker, pos,
@@ -1559,7 +1564,7 @@ HWY_NOINLINE void TileFlashAttentionReturnExpSumsAndMaxLogits(
           x_1_p_1, x_2_p_0, x_2_p_1, x_3_p_0, x_3_p_1, x_4_p_0, x_4_p_1,
           x_5_p_0, x_5_p_1, x_6_p_0, x_6_p_1, x_7_p_0, x_7_p_1);
     } else {
-      static_assert(false,
+      static_assert(sizeof(Q_T) == 0,
                     "Query type not supported, only float, BF16, and "
                     "Int16 are supported");
     }

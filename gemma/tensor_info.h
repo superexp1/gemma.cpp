@@ -97,6 +97,11 @@ static inline std::string LayerSuffix(size_t layer_idx) {
   return std::string("_") + std::to_string(layer_idx);
 }
 
+static inline std::string MoESuffix(size_t layer_idx, size_t expert_idx) {
+  return std::string("_") + std::to_string(layer_idx) + "_" +
+         std::to_string(expert_idx);
+}
+
 // Returns tensor base name without any layer suffix.
 static inline std::string StripLayerSuffix(const std::string& name) {
   return name.substr(0, name.rfind('_'));

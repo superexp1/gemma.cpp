@@ -24,9 +24,9 @@
 
 #include "gemma/configs.h"     // ModelConfig
 #include "gemma/gemma_args.h"  // InferenceArgs
-#include "util/basics.h"       // BF16
-#include "util/mat.h"
 #include "hwy/base.h"
+#include "util/basics.h"  // BF16
+#include "util/mat.h"
 
 namespace gcpp {
 
@@ -62,9 +62,7 @@ struct KVCache {
     return kv_cache.Rows();
   }
 
-  bool IsTiled() const {
-    return tiled_seq_len.has_value();
-  }
+  bool IsTiled() const { return tiled_seq_len.has_value(); }
 
   // This function returns a vector of pointers and handles wraparound for local
   // layers.
@@ -74,8 +72,8 @@ struct KVCache {
   // layers start_pos might be in a middle of the first tile. At start_pos %
   // kTileSize
   std::vector<MatPtr> GetPointers(int layer_idx, int kv_head_idx,
-                                                int num_kv_heads, int start_pos,
-                                                bool is_global_layer) {
+                                  int num_kv_heads, int start_pos,
+                                  bool is_global_layer) {
     if (!IsTiled()) {
       HWY_ABORT("This function is only meant to be used with tiled KV caches.");
     }
@@ -193,6 +191,7 @@ struct KVCache {
         .kv_cache = kv_cache,
         .k_cache = k_cache,
         .v_cache = v_cache,
+        .cache = this,
     };
   }
 

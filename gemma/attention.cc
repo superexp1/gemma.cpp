@@ -28,12 +28,12 @@
 #include "gemma/kv_cache.h"
 #include "gemma/query.h"
 #include "gemma/weights.h"
+#include "hwy/base.h"
+#include "hwy/profiler.h"
 #include "ops/matmul.h"
 #include "util/threading.h"
 #include "util/threading_context.h"
 #include "util/zones.h"
-#include "hwy/base.h"
-#include "hwy/profiler.h"
 
 // Compiles this file for multiple architectures via "foreach_target.h", to
 // which we pass the filename via macro 'argument'.
@@ -193,10 +193,9 @@ static HWY_INLINE void ComputeQKV(size_t num_tokens, const size_t layer_idx,
   const size_t kv_heads = layer_config.kv_heads;
   const size_t cache_layer_size = layer_config.CacheLayerSize();
 
-
   ClampInplace(layer.qc_in, activations.pre_att_rms_out);
 
-    // The original qkv_einsum_w has shape [(heads + kv_heads * 2), qkv_dim,
+  // The original qkv_einsum_w has shape [(heads + kv_heads * 2), qkv_dim,
   // model_dim], which we reshaped to (heads + kv_heads * 2) * qkv_dim rows.
   CallMatMul(activations.pre_att_rms_out, layer.qkv_einsum_w1,
              /*add=*/nullptr, env, activations.q);
@@ -217,9 +216,10 @@ static HWY_INLINE void ComputeQKV(size_t num_tokens, const size_t layer_idx,
     // --seq_len must be large enough to avoid wraparound.
     HWY_DASSERT(cache_pos < activations.SeqLen());
 
-    const size_t layer_offset = qbatch.KV(qi).cache->layer_flat_offsets.empty()
-        ? layer_idx * cache_layer_size
-        : qbatch.KV(qi).cache->layer_flat_offsets[layer_idx];
+    const size_t layer_offset =
+        qbatch.KV(qi).cache->layer_flat_offsets.empty()
+            ? layer_idx * cache_layer_size
+            : qbatch.KV(qi).cache->layer_flat_offsets[layer_idx];
 
     env.row_ptrs[0][interleaved_idx] = reinterpret_cast<uint8_t*>(
         qbatch.KV(qi).kv_cache.Row(cache_pos) + layer_offset);
@@ -231,10 +231,8 @@ static HWY_INLINE void ComputeQKV(size_t num_tokens, const size_t layer_idx,
   ClampInplace(layer.kvc_out, kv_rows);
 
   for (size_t qi = 0; qi < qbatch.Size(); ++qi) {
-    MaybeReshapeCache(qbatch.KV(qi).cache->k_v_cols,
-                      qbatch.KV(qi).k_cache);
-    MaybeReshapeCache(qbatch.KV(qi).cache->k_v_cols,
-                      qbatch.KV(qi).v_cache);
+    MaybeReshapeCache(qbatch.KV(qi).cache->k_v_cols, qbatch.KV(qi).k_cache);
+    MaybeReshapeCache(qbatch.KV(qi).cache->k_v_cols, qbatch.KV(qi).v_cache);
   }
   const size_t kFloatsPerVector = FloatsPerVector();
   const size_t kRoundedTokens =
@@ -279,12 +277,12 @@ static HWY_INLINE void ComputeQKV(size_t num_tokens, const size_t layer_idx,
         // --seq_len must be large enough to avoid wraparound.
         HWY_DASSERT(cache_pos < activations.SeqLen());
         auto& kv_cache = qbatch.KV(qi).kv_cache;
-        const size_t layer_offset = qbatch.KV(qi).cache->layer_flat_offsets.empty()
-            ? layer_idx * cache_layer_size
-            : qbatch.KV(qi).cache->layer_flat_offsets[layer_idx];
-        KV_t* HWY_RESTRICT kv = kv_cache.Row(cache_pos) +
-                                layer_offset +
-                                head * qkv_dim * 2;
+        const size_t layer_offset =
+            qbatch.KV(qi).cache->layer_flat_offsets.empty()
+                ? layer_idx * cache_layer_size
+                : qbatch.KV(qi).cache->layer_flat_offsets[layer_idx];
+        KV_t* HWY_RESTRICT kv =
+            kv_cache.Row(cache_pos) + layer_offset + head * qkv_dim * 2;
         // Note that k_cache and v_cache are different shapes.
         // The innermost dimension of k is 2 values from qkv_dim because they
         // are going to be used in a BF16 dot product involving pairs of
@@ -298,8 +296,14 @@ static HWY_INLINE void ComputeQKV(size_t num_tokens, const size_t layer_idx,
         // Apply further processing to K.
         if (layer.key_norm_scale.HasPtr()) {
           CallUpcasted(&layer.key_norm_scale, [&](const auto* weights_t) {
-            RMSNormInplace(weights_t->PackedScale1(), /*w_ofs=*/0, kv_f32,
-                                 qkv_dim, env.ctx, worker);
+            if (activations.config.model == Model::GEMMA4_26B_MOE) {
+              RMSNormDirectScaleInplace(weights_t->PackedScale1(),
+                                        /*w_ofs=*/0, kv_f32, qkv_dim, env.ctx,
+                                        worker);
+            } else {
+              RMSNormInplace(weights_t->PackedScale1(), /*w_ofs=*/0, kv_f32,
+                             qkv_dim, env.ctx, worker);
+            }
           });
         } else if (layer_config.post_qk == PostQKType::NormLocalRope) {
           RMSNormNoScaleInplace(kv_f32, qkv_dim, env.ctx, worker);

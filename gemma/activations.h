@@ -23,7 +23,7 @@
 #include <atomic>
 #include <vector>
 
-#include "gemma/configs.h"     // ModelConfig
+#include "gemma/configs.h"  // ModelConfig
 #include "gemma/flash_structs.h"
 #include "gemma/gemma_args.h"  // AttentionImpl
 #include "gemma/kv_cache.h"
@@ -34,6 +34,12 @@
 #include "util/threading_context.h"
 
 namespace gcpp {
+
+struct PerToken {
+  float weight;
+  uint16_t expert_idx;
+  uint16_t row_idx;
+};
 
 typedef std::vector<float, hwy::AlignedAllocator<float>> AlignedFloatVector;
 typedef std::vector<BF16, hwy::AlignedAllocator<BF16>> AlignedBF16Vector;
@@ -53,8 +59,7 @@ static inline float ChooseQueryScale(const ModelConfig& config) {
   if (config.query_scale == QueryScaleType::SqrtModelDimDivNumHeads)
     return 1.0f /
            sqrtf(static_cast<float>(config.model_dim / layer_config.heads));
-  if (config.query_scale == QueryScaleType::One)
-    return 1.0f;
+  if (config.query_scale == QueryScaleType::One) return 1.0f;
   // QueryScaleType::SqrtKeySize
   return 1.0f / sqrtf(static_cast<float>(layer_config.qkv_dim));
 }
@@ -87,22 +92,18 @@ struct AttentionActivations {
         vit_Q(MatFactory("Q2", batch_size, max_qkv_dim, allocator)),
         vit_K_T(MatFactory(
             "K2_T", hwy::RoundUpTo(seq_len, kMaxBF16PerVector),
-            layer_config.heads *
-                hwy::RoundUpTo(max_qkv_dim, kMaxBF16PerVector),
+            layer_config.heads * hwy::RoundUpTo(max_qkv_dim, kMaxBF16PerVector),
             allocator, MatPadding::kPacked)),
         vit_V_T(MatFactory(
             "V2_T", hwy::RoundUpTo(seq_len, kMaxBF16PerVector),
-            layer_config.heads *
-                hwy::RoundUpTo(max_qkv_dim, kMaxBF16PerVector),
+            layer_config.heads * hwy::RoundUpTo(max_qkv_dim, kMaxBF16PerVector),
             allocator, MatPadding::kPacked)),
         pre_att_rms_out(MatFactory("pre_att_rms_out", batch_size,
                                    config.model_dim, allocator)),
         att_out(MatFactory("att_out", batch_size,
-                           layer_config.heads * max_qkv_dim,
-                           allocator)),
+                           layer_config.heads * max_qkv_dim, allocator)),
         att_out_reps(MatFactory("att_out", batch_size * rep_factor,
-                                layer_config.heads * max_qkv_dim,
-                                allocator)),
+                                layer_config.heads * max_qkv_dim, allocator)),
         softmax_max(MatFactory("softmax_max", batch_size, layer_config.heads,
                                allocator)),
         softmax_d(
@@ -115,9 +116,7 @@ struct AttentionActivations {
                                layer_config.post_qk == PostQKType::HalfRope)),
         inv_timescale_global(CreateInvTimescale(
             allocator,
-            config.partial_rotary_factor < 1.0f
-                ? max_qkv_dim
-                : max_qkv_dim / 4,
+            config.partial_rotary_factor < 1.0f ? max_qkv_dim : max_qkv_dim / 4,
             layer_config.post_qk == PostQKType::HalfRope, 1000000.0,
             config.partial_rotary_factor)) {
     // Batch size can be 0 in experimental code so do not assert.
@@ -187,20 +186,18 @@ struct AttentionActivations {
   MatStorageT<KV_t> vit_V_T;
 
   MatStorageT<float> pre_att_rms_out;
-  MatStorageT<float> att_out;      // attention output
+  MatStorageT<float> att_out;       // attention output
   MatStorageT<float> att_out_reps;  // attention output for each thread.
-  MatStorageT<float> softmax_max;  // see OnlineSoftmaxState
-  MatStorageT<float> softmax_d;    // see OnlineSoftmaxState
+  MatStorageT<float> softmax_max;   // see OnlineSoftmaxState
+  MatStorageT<float> softmax_d;     // see OnlineSoftmaxState
   // Accumulation of attention outputs over heads
   MatStorageT<BF16> att_sums;
 
   MatStorageT<float> k_tile_vec;
   MatStorageT<float> v_tile_vec;
   std::vector<MatStorageT<float>> sub_task_att_out;
-  std::vector<AlignedFloatVector>
-      sub_task_exp_denominator_sums;
-  std::vector<AlignedFloatVector>
-      sub_task_max_logits;
+  std::vector<AlignedFloatVector> sub_task_exp_denominator_sums;
+  std::vector<AlignedFloatVector> sub_task_max_logits;
 
   // Rope
   MatStorageT<float> inv_timescale;
@@ -307,10 +304,8 @@ struct AttentionActivationsPtrs {
   MatPtrT<float> v_tile_vec;
   // Used by TiledFlashAttention to store intermediate results.
   std::vector<MatStorageT<float>>* sub_task_att_out;
-  std::vector<AlignedFloatVector>*
-      sub_task_exp_denominator_sums;
-  std::vector<AlignedFloatVector>*
-      sub_task_max_logits;
+  std::vector<AlignedFloatVector>* sub_task_exp_denominator_sums;
+  std::vector<AlignedFloatVector>* sub_task_max_logits;
   AlignedBF16Vector* bf16_queries;
   std::vector<int16_t, hwy::AlignedAllocator<int16_t>>* int16_queries;
   AlignedFloatVector* float_queries;
@@ -328,6 +323,29 @@ struct AttentionActivationsPtrs {
 };
 
 struct Activations {
+  struct PerCluster {
+    PerCluster(const ModelConfig& config, size_t batch_size,
+               Allocator& allocator)
+        : ffw_expert_in(MatFactory("ffw_expert_in", batch_size,
+                                   config.model_dim, allocator)),
+          moe_C1(MatFactory("moe_C1", batch_size,
+                            config.layer_configs[0].ff_hidden_dim, allocator)),
+          moe_C2(MatFactory("moe_C2", batch_size,
+                            config.layer_configs[0].ff_hidden_dim, allocator)) {
+    }
+
+    void AllocateAndAttachRowPtrs(
+        std::vector<hwy::AlignedFreeUniquePtr<uint8_t*[]>>& row_ptrs) {
+      ffw_expert_in.AllocateAndAttachRowPtrs(row_ptrs);
+      moe_C1.AllocateAndAttachRowPtrs(row_ptrs);
+      moe_C2.AllocateAndAttachRowPtrs(row_ptrs);
+    }
+
+    MatStorageT<BF16> ffw_expert_in;
+    MatStorageT<BF16> moe_C1;
+    MatStorageT<BF16> moe_C2;
+  };
+
   Activations(const RuntimeConfig& runtime_config, const ModelConfig& config,
               size_t batch_size, size_t seq_len, ThreadingContext& ctx,
               std::vector<hwy::AlignedFreeUniquePtr<uint8_t*[]>>& row_ptrs)
@@ -348,6 +366,12 @@ struct Activations {
         ffw_out(
             MatFactory("ffw_out", batch_size, config.model_dim, ctx.allocator)),
 
+        router_in(MatFactory("router_in", batch_size, config.model_dim,
+                             ctx.allocator)),
+        router_logits(MatFactory("router_logits", batch_size,
+                                 layer_config.NumExperts(), ctx.allocator)),
+        num_experts_per_datapoint(layer_config.NumExpertsPerDatapoint()),
+
         max_workers(ctx.pools.MaxWorkers()),
         s_ffw_in(config.num_layers, max_workers),
         s_ffw_hidden(config.num_layers, max_workers),
@@ -356,6 +380,14 @@ struct Activations {
         s_w_gating_einsum_w1(config.num_layers, max_workers),
         s_w_gating_einsum_w2(config.num_layers, max_workers),
         s_w_linear_w(config.num_layers, max_workers),
+        s_w_expert_in1(config.num_layers, max_workers),
+        s_w_expert_in2(config.num_layers, max_workers),
+        s_w_expert_hidden(config.num_layers, max_workers),
+        s_expert_in(config.num_layers, max_workers),
+        s_expert_hidden(config.num_layers, max_workers),
+        s_expert_out(config.num_layers, max_workers),
+        s_router_in(config.num_layers, max_workers),
+        s_router_logits(config.num_layers, max_workers),
         attention_impl(runtime_config.attention_impl),
         attention_storage(config, layer_config, batch_size, seq_len,
                           runtime_config, ctx.pools.MaxWorkers(), ctx.allocator,
@@ -373,6 +405,24 @@ struct Activations {
     C2.AllocateAndAttachRowPtrs(row_ptrs);
     ffw_out.AllocateAndAttachRowPtrs(row_ptrs);
 
+    if (layer_config.NumExperts() > 0) {
+      router_in.AllocateAndAttachRowPtrs(row_ptrs);
+      router_logits.AllocateAndAttachRowPtrs(row_ptrs);
+      per_cluster.reserve(ctx.pools.NumClusters());
+      for (size_t c = 0; c < ctx.pools.NumClusters(); ++c) {
+        per_cluster.emplace_back(config, batch_size, ctx.allocator);
+        per_cluster.back().AllocateAndAttachRowPtrs(row_ptrs);
+      }
+      ffw_expert_out.reserve(layer_config.NumExperts());
+      for (uint32_t i = 0; i < layer_config.NumExperts(); ++i) {
+        ffw_expert_out.emplace_back(MatFactory(
+            "ffw_expert_out", batch_size, config.model_dim, ctx.allocator));
+        ffw_expert_out.back().AllocateAndAttachRowPtrs(row_ptrs);
+      }
+      expert_tokens.resize(batch_size * layer_config.NumExpertsPerDatapoint());
+      per_token_data.resize(batch_size * layer_config.NumExpertsPerDatapoint());
+    }
+
     // Note that BindC on any MatMul output considerably slows down Prefill.
   }
 
@@ -380,6 +430,21 @@ struct Activations {
     s_ffw_in.ReduceAndPrint("ffw_in");
     s_ffw_hidden.ReduceAndPrint("ffw_hidden");
     s_ffw_out.ReduceAndPrint("ffw_out");
+    s_w_expert_in1.ReduceAndPrint("w_expert_in1");
+    s_w_expert_in2.ReduceAndPrint("w_expert_in2");
+    s_w_expert_hidden.ReduceAndPrint("w_expert_hidden");
+    s_expert_in.ReduceAndPrint("expert_in");
+    s_expert_hidden.ReduceAndPrint("expert_hidden");
+    s_expert_out.ReduceAndPrint("expert_out");
+    s_router_in.ReduceAndPrint("router_in");
+    s_router_logits.ReduceAndPrint("router_logits");
+  }
+
+  const PerToken* GetPerToken(size_t token_idx) const {
+    return &per_token_data[token_idx * num_experts_per_datapoint];
+  }
+  PerToken* GetPerToken(size_t token_idx) {
+    return &per_token_data[token_idx * num_experts_per_datapoint];
   }
 
   // Negligible CPU time.
@@ -393,6 +458,21 @@ struct Activations {
     C1.OverrideRows(batch_size);
     C2.OverrideRows(batch_size);
     ffw_out.OverrideRows(batch_size);
+
+    if (layer_config.NumExperts() > 0) {
+      router_in.OverrideRows(batch_size);
+      router_logits.OverrideRows(batch_size);
+      for (auto& pc : per_cluster) {
+        pc.ffw_expert_in.OverrideRows(batch_size);
+        pc.moe_C1.OverrideRows(batch_size);
+        pc.moe_C2.OverrideRows(batch_size);
+      }
+      for (auto& eo : ffw_expert_out) {
+        eo.OverrideRows(batch_size);
+      }
+      expert_tokens.resize(batch_size * num_experts_per_datapoint);
+      per_token_data.resize(batch_size * num_experts_per_datapoint);
+    }
 
     attention_storage.SetBatchSize(batch_size);
     // `AttentionActivationsPtrs` holds `MatPtrT` which also require updating;
@@ -413,6 +493,15 @@ struct Activations {
   MatStorageT<BF16> C2;
   MatStorageT<float> ffw_out;
 
+  // MoE
+  MatStorageT<BF16> router_in;
+  MatStorageT<float> router_logits;
+  std::vector<PerCluster> per_cluster;
+  std::vector<MatStorageT<BF16>> ffw_expert_out;
+  std::vector<uint16_t> expert_tokens;
+  std::vector<PerToken> per_token_data;
+  size_t num_experts_per_datapoint;
+
   const size_t max_workers;
   TensorStats s_ffw_in;
   TensorStats s_ffw_hidden;  // after Activation+gating
@@ -421,6 +510,14 @@ struct Activations {
   TensorStats s_w_gating_einsum_w1;
   TensorStats s_w_gating_einsum_w2;
   TensorStats s_w_linear_w;
+  TensorStats s_w_expert_in1;
+  TensorStats s_w_expert_in2;
+  TensorStats s_w_expert_hidden;
+  TensorStats s_expert_in;
+  TensorStats s_expert_hidden;
+  TensorStats s_expert_out;
+  TensorStats s_router_in;
+  TensorStats s_router_logits;
 
   AttentionImpl attention_impl;
 

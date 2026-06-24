@@ -14,9 +14,9 @@
 #include "gemma/configs.h"
 #include "gemma/gemma.h"
 #include "gemma/kv_cache.h"
-#include "ops/matmul.h"
 #include "hwy/aligned_allocator.h"
 #include "hwy/base.h"
+#include "ops/matmul.h"
 
 // Note: HWY_DISABLED_TARGETS needs to be defined the same everywhere.
 #ifndef HWY_DISABLED_TARGETS
@@ -130,8 +130,8 @@ static HWY_INLINE void ComputeQKVTransposedTile(
   hwy::Divisor div_kv_heads(kv_heads);
 
   bool is_transposed_qs =
-      attention_impl == AttentionImpl::kFlashTransposedQsBF16
-      || attention_impl == AttentionImpl::kFlashTransposedQsInt16;
+      attention_impl == AttentionImpl::kFlashTransposedQsBF16 ||
+      attention_impl == AttentionImpl::kFlashTransposedQsInt16;
 
   hn::ScalableTag<float> df;
   static hwy::Divisor tile_size_divisor(KVCache::kTileSize);
@@ -149,9 +149,8 @@ static HWY_INLINE void ComputeQKVTransposedTile(
         const size_t start_pos = qbatch.Pos(query_idx);
         const bool is_global_layer =
             activations.config.IsGlobalLayer(layer_idx);
-        std::vector<MatPtr> kv_ptrs =
-            qbatch.KV(query_idx).cache->GetPointers(
-                layer_idx, kv_head, kv_heads, start_pos, is_global_layer);
+        std::vector<MatPtr> kv_ptrs = qbatch.KV(query_idx).cache->GetPointers(
+            layer_idx, kv_head, kv_heads, start_pos, is_global_layer);
         size_t tile_offset = 0;
         if (!is_global_layer) {
           tile_offset = start_pos / KVCache::kTileSize;
@@ -200,14 +199,19 @@ static HWY_INLINE void ComputeQKVTransposedTile(
             hwy::CopyBytes(k_values, k_f32, qkv_dim * sizeof(float));
             if (layer.key_norm_scale.HasPtr()) {
               CallUpcasted(&layer.key_norm_scale, [&](const auto* weights_t) {
-                RMSNormInplace(weights_t->PackedScale1(), /*w_ofs=*/0, k_f32,
-                               qkv_dim, env.ctx, worker);
+                if (activations.config.model == Model::GEMMA4_26B_MOE) {
+                  RMSNormDirectScaleInplace(weights_t->PackedScale1(),
+                                            /*w_ofs=*/0, k_f32, qkv_dim,
+                                            env.ctx, worker);
+                } else {
+                  RMSNormInplace(weights_t->PackedScale1(), /*w_ofs=*/0, k_f32,
+                                 qkv_dim, env.ctx, worker);
+                }
               });
             }
-            PositionalEncodingQK(
-                k_f32, layer_idx, activations, env.ctx, worker,
-                current_pos ,
-                /*mul=*/1.0f);
+            PositionalEncodingQK(k_f32, layer_idx, activations, env.ctx, worker,
+                                 current_pos,
+                                 /*mul=*/1.0f);
 
             const size_t in_tile_idx = current_pos_mod % KVCache::kTileSize;
             // `v_cache_values` is a pointer to the V data that will be
@@ -217,6 +221,11 @@ static HWY_INLINE void ComputeQKVTransposedTile(
             // `v_buf` is a temporary buffer used only when quantizing V values
             // to int8_t.
             HWY_ALIGN float v_buf[kMaxQKVDim];
+            if (layer_config.norm_v) {
+              hwy::CopyBytes(v_values, v_buf, qkv_dim * sizeof(float));
+              RMSNormNoScaleInplace(v_buf, qkv_dim, env.ctx, worker);
+              v_cache_values = v_buf;
+            }
 
             if constexpr (IsInt8<KV_T>()) {
               BF16* scales_ptr = HWY_RCAST_ALIGNED(
@@ -250,7 +259,9 @@ static HWY_INLINE void ComputeQKVTransposedTile(
 
               // V Scaling: Copy `v_values` to `v_buf`, scale `v_buf` in-place,
               // and then update `v_cache_values` to point to `v_buf`.
-              hwy::CopyBytes(v_values, v_buf, qkv_dim * sizeof(float));
+              if (!layer_config.norm_v) {
+                hwy::CopyBytes(v_values, v_buf, qkv_dim * sizeof(float));
+              }
               scale_and_store(v_buf, qkv_dim, KVCache::kTileSize + in_tile_idx);
               v_cache_values = v_buf;
             }
@@ -490,8 +501,7 @@ void LocalAttentionForAllHeadsTokensAndBatch(
       [&](size_t task_idx, size_t worker) HWY_ATTR {
         size_t main_task_idx = task_idx / task_multiplier;
         size_t sub_task_idx = task_idx % task_multiplier;
-        size_t current_qbatch_idx =
-            main_task_idx / layer.layer_config.kv_heads;
+        size_t current_qbatch_idx = main_task_idx / layer.layer_config.kv_heads;
         size_t kv_head_idx = main_task_idx % layer.layer_config.kv_heads;
         // First and last context token we will attend to.
         size_t global_start_context_pos = StartPos(
@@ -580,8 +590,7 @@ void LocalAttentionForAllHeadsTokensAndBatch(
         size_t rounded_down_global_start_pos =
             hwy::RoundDownTo(global_start_context_pos, KVCache::kTileSize);
         for (int token_idx = 0; token_idx < num_query_tokens; ++token_idx) {
-          int64_t global_query_pos =
-              qbatch.Pos(current_qbatch_idx) + token_idx;
+          int64_t global_query_pos = qbatch.Pos(current_qbatch_idx) + token_idx;
           // Intersect context to attend to for this specific query token
           // to the context tokens of the current subtask.
           int64_t query_last_context_pos = std::min(

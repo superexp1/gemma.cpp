@@ -65,22 +65,23 @@ PYBIND11_MODULE(configs, py_module) {
 
   enum_<PostNormType>(py_module, "PostNormType")
       .value("NoPostNorm", PostNormType::None)
-  .value("Scale", PostNormType::Scale);
+      .value("NoScale", PostNormType::NoScale)
+      .value("Scale", PostNormType::Scale);
 
   enum_<PostQKType>(py_module, "PostQKType")
       .value("Rope", PostQKType::Rope)
-  .value("HalfRope", PostQKType::HalfRope);
+      .value("HalfRope", PostQKType::HalfRope);
 
   enum_<ActivationType>(py_module, "ActivationType")
-  .value("Gelu", ActivationType::Gelu);
+      .value("Gelu", ActivationType::Gelu);
 
   enum_<QueryScaleType>(py_module, "QueryScaleType")
       .value("SqrtKeySize", QueryScaleType::SqrtKeySize)
-  .value("SqrtModelDimDivNumHeads",
-         QueryScaleType::SqrtModelDimDivNumHeads);
+      .value("SqrtModelDimDivNumHeads",
+             QueryScaleType::SqrtModelDimDivNumHeads);
 
   enum_<ResidualType>(py_module, "ResidualType")
-  .value("Add", ResidualType::Add);
+      .value("Add", ResidualType::Add);
 
   enum_<Model>(py_module, "Model")
       .value("UNKNOWN", Model::UNKNOWN)
@@ -100,8 +101,7 @@ PYBIND11_MODULE(configs, py_module) {
       .value("GEMMA3_4B_LM", Model::GEMMA3_4B_LM)
       .value("GEMMA3_12B_LM", Model::GEMMA3_12B_LM)
       .value("GEMMA3_27B_LM", Model::GEMMA3_27B_LM)
-      // Insert new models above this line.
-  .value("PALIGEMMA_448", Model::PALIGEMMA_448);
+      .value("GEMMA4_26B_MOE", Model::GEMMA4_26B_MOE);
 
   class_<TensorInfo>(py_module, "TensorInfo")
       .def(init())
@@ -124,8 +124,7 @@ PYBIND11_MODULE(configs, py_module) {
       .def("tensor_info_from_name", &TensorInfoRegistry::TensorInfoFromName,
            arg("name"));
 
-  class_<InternalLayerConfig>(py_module, "InternalLayerConfig")
-      .def(init<>());
+  class_<InternalLayerConfig>(py_module, "InternalLayerConfig").def(init<>());
 
   class_<LayerConfig>(py_module, "LayerConfig")
       .def(init())
@@ -152,7 +151,9 @@ PYBIND11_MODULE(configs, py_module) {
       .def_readwrite("image_size", &VitConfig::image_size)
       .def_readwrite("layer_configs", &VitConfig::layer_configs);
 
-  class_<InternalModelConfig>(py_module, "InternalModelConfig").def(init<>());
+  class_<InternalModelConfig>(py_module, "InternalModelConfig")
+      .def(init<>())
+      .def_readwrite("share_kv_cache", &InternalModelConfig::share_kv_cache);
 
   class_<ModelConfig>(py_module, "ModelConfig")
       .def(init<>())
@@ -182,8 +183,7 @@ PYBIND11_MODULE(configs, py_module) {
       .def_readwrite("secondary_eos_id", &ModelConfig::secondary_eos_id)
       .def_readwrite("scale_base_names", &ModelConfig::scale_base_names)
       .def_readwrite("internal", &ModelConfig::internal)
-      .def_readwrite("use_global_timescale",
-                     &ModelConfig::use_global_timescale)
+      .def_readwrite("use_global_timescale", &ModelConfig::use_global_timescale)
 
       .def("add_layer_config", &ModelConfig::AddLayerConfig,
            arg("layer_config"))

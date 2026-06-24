@@ -22,7 +22,7 @@
 #include <vector>
 
 #include "gemma/configs.h"  // PromptWrapping
-#include "hwy/base.h"         // HWY_ASSERT
+#include "hwy/base.h"       // HWY_ASSERT
 #include "hwy/profiler.h"
 // copybara:import_next_line:sentencepiece
 #include "src/sentencepiece_processor.h"
@@ -107,7 +107,7 @@ bool GemmaTokenizer::Decode(const std::vector<int>& ids,
 // Negligible CPU time in the ctor body.
 GemmaChatTemplate::GemmaChatTemplate(const GemmaTokenizer& tokenizer,
                                      Model model) {
-  if (model == Model::GEMMA4_26B_MOE || model == Model::GEMMA4_2B) {
+  if (model == Model::GEMMA4_26B_MOE) {
     sot_user_ = {105, 2364, 107};
     sot_model_ = {105, 4368, 107, 100, 45518, 107, 101};
     eot_ = {106, 107};
