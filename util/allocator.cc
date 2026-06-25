@@ -141,7 +141,7 @@ CacheInfo::CacheInfo(const BoundedTopology& topology) {
   // Ensure MaxLineBytes() is an upper bound.
   HWY_ASSERT(MaxLineBytes() >= LineBytes());
 
-  vector_bytes_ = hwy::VectorBytes();
+  vector_bytes_ = HWY_MAX(hwy::VectorBytes(), size_t{1});
 
   step_bytes_ = HWY_MAX(line_bytes_, vector_bytes_);
 

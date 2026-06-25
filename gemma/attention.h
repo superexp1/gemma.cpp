@@ -32,7 +32,11 @@
 namespace gcpp {
 
 // Returns the number of floats per vector (aka NF).
-inline size_t FloatsPerVector() { return hwy::VectorBytes() / sizeof(float); }
+inline size_t FloatsPerVector() {
+  namespace hn = hwy::HWY_NAMESPACE;
+  const hn::ScalableTag<float> df;
+  return hn::Lanes(df);
+}
 
 // The attention window usually starts at 0 unless `pos` is larger than
 // the attention window size, then it is `pos` - window_size + 1.
@@ -47,7 +51,13 @@ inline size_t StartPos(size_t pos, const ModelConfig& config,
 // FlashAttention.
 inline void MaybeReshapeCache(const size_t default_cols, MatPtrT<KV_t>& cache) {
   if (default_cols == cache.Cols()) {
-    cache.ReshapePackedRowsToCols(2 * FloatsPerVector());
+    const size_t factor = 2 * FloatsPerVector();
+    if (HWY_UNLIKELY(factor > kMaxBF16PerVector)) {
+      HWY_ABORT(
+          "KV cache padding supports %zu BF16 lanes, but target requires %zu.",
+          kMaxBF16PerVector, factor);
+    }
+    cache.ReshapePackedRowsToCols(factor);
   }
 }
 

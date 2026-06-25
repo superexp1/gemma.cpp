@@ -155,9 +155,11 @@ using Logits = hwy::Span<float>;  // size() is vocab_size.
 // Non-cryptographic 64-bit pseudo-random number generator. Supports random or
 // deterministic seeding.
 //
-// Based on 5-round AES-CTR. Supports 2^64 streams, each with period 2^64. This
-// is useful for parallel sampling. Each thread can generate the stream for a
-// particular task, without caring about prior/subsequent generations.
+// Based on 5-round AES-CTR when Highway provides 128-bit AES support, with a
+// scalar mixing fallback for targets without that support. Supports 2^64
+// streams, each with period 2^64. This is useful for parallel sampling. Each
+// thread can generate the stream for a particular task, without caring about
+// prior/subsequent generations.
 class alignas(16) AesCtrEngine {
   // "Large-scale randomness study of security margins for 100+ cryptographic
   // functions": at least four.

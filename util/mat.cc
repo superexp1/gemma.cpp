@@ -95,6 +95,9 @@ void MatOwner::AllocateFor(MatPtr& mat, const Allocator& allocator,
   const size_t padded_bytes =
       hwy::RoundUpTo(bytes, allocator.QuantumBytes() / mat.ElementBytes());
   storage_ = allocator.AllocBytes(padded_bytes);
+  if (HWY_UNLIKELY(storage_ == nullptr)) {
+    HWY_ABORT("%s: failed to allocate %zu bytes", mat.Name(), padded_bytes);
+  }
   mat.SetPtr(storage_.get(), stride);
 }
 

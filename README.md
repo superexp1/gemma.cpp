@@ -199,6 +199,46 @@ If you prefer Makefiles, @jart has made one available here:
 
 https://github.com/jart/gemma3/blob/main/Makefile
 
+#### RISC-V
+
+gemma.cpp also builds for Linux riscv64 targets. A typical cross-build uses a
+riscv64 Linux toolchain, a riscv64 sysroot, and qemu-user for smoke tests:
+
+```sh
+cmake -S . -B build-riscv \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_SYSTEM_NAME=Linux \
+  -DCMAKE_SYSTEM_PROCESSOR=riscv64 \
+  -DCMAKE_CXX_COMPILER=riscv64-linux-gnu-g++ \
+  -DCMAKE_C_COMPILER=riscv64-linux-gnu-gcc \
+  -DCMAKE_FIND_ROOT_PATH=/usr/riscv64-linux-gnu \
+  -DCMAKE_FIND_ROOT_PATH_MODE_PROGRAM=NEVER \
+  -DCMAKE_FIND_ROOT_PATH_MODE_LIBRARY=ONLY \
+  -DCMAKE_FIND_ROOT_PATH_MODE_INCLUDE=ONLY \
+  -DGEMMA_ENABLE_OPENSSL=OFF
+
+cmake --build build-riscv --target gemma -j "$(nproc)"
+```
+
+Run the cross-built binary with qemu-user and the same sysroot:
+
+```sh
+qemu-riscv64 -L /usr/riscv64-linux-gnu build-riscv/gemma \
+  --weights /path/to/model.sbs \
+  --prompt x \
+  --wrapping 0 \
+  --seq_len 64 \
+  --max_generated_tokens 1 \
+  --num_threads 22 \
+  --map 1
+```
+
+The RISC-V qemu-user path has been smoke-tested with Gemma 3 4B SFP and Gemma 4
+26B MoE SFP single-file weights. On a 22-thread qemu-user Gemma 4 MoE smoke
+test, gemma.cpp generated one token with 13 prompt tokens in 145.8 seconds
+time-to-first-token and 23.0 seconds for the generated token. Native RISC-V
+hardware should be used for meaningful performance measurement.
+
 ### Step 4: Run
 
 You can now run `gemma` from inside the `build/` directory.

@@ -33,7 +33,12 @@
 
 namespace gcpp {
 
-constexpr size_t kMaxBF16PerVector = HWY_ARCH_MAX_BYTES / sizeof(BF16);
+// Bound KV-cache padding for scalable-vector architectures. HWY_ARCH_MAX_BYTES
+// can be a very large theoretical maximum there, which would otherwise inflate
+// the transposed KV cache by orders of magnitude before the actual target lane
+// count is known.
+constexpr size_t kMaxKVCacheVectorBytes = HWY_MIN(HWY_ARCH_MAX_BYTES, 64);
+constexpr size_t kMaxBF16PerVector = kMaxKVCacheVectorBytes / sizeof(BF16);
 
 HWY_INLINE_VAR constexpr size_t kMaxQKVDim = 1024;
 

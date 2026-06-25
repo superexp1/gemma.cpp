@@ -60,6 +60,27 @@ AesCtrEngine::AesCtrEngine(bool deterministic) {
 }
 
 namespace hn = hwy::HWY_NAMESPACE;
+
+#if HWY_TARGET == HWY_SCALAR && !HWY_IDE
+
+static uint64_t Mix64(uint64_t x) {
+  x ^= x >> 30;
+  x *= 0xBF58476D1CE4E5B9ull;
+  x ^= x >> 27;
+  x *= 0x94D049BB133111EBull;
+  x ^= x >> 31;
+  return x;
+}
+
+uint64_t AesCtrEngine::operator()(uint64_t stream, uint64_t counter) const {
+  const uint64_t stream_key = Mix64(stream ^ key_[0]);
+  const uint64_t counter_key =
+      counter + key_[1] + 0x9E3779B97F4A7C15ull * (stream_key | 1);
+  return Mix64(counter_key ^ stream_key);
+}
+
+#else
+
 using D = hn::Full128<uint8_t>;  // 128 bits for AES
 using V = hn::Vec<D>;
 
@@ -84,5 +105,7 @@ uint64_t AesCtrEngine::operator()(uint64_t stream, uint64_t counter) const {
   // Return lower 64 bits of the u8 vector.
   return hn::GetLane(hn::BitCast(d64, state));
 }
+
+#endif
 
 }  // namespace gcpp

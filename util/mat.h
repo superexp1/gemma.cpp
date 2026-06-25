@@ -119,7 +119,7 @@ class MatPtr : public IFields {
   // pointers in each call to MatMul.
   void AllocateAndAttachRowPtrs(
       std::vector<hwy::AlignedFreeUniquePtr<uint8_t*[]>>& row_ptrs) {
-    if (!HasPtr()) return;
+    if (!HasPtr() || Rows() == 0) return;
     row_ptrs.push_back(hwy::AllocateAligned<uint8_t*>(Rows()));
     uint8_t** ptrs = row_ptrs.back().get();
     for (size_t r = 0; r < Rows(); ++r) {
